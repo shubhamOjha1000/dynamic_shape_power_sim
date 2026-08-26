@@ -25,7 +25,8 @@ from .template import (
     rewrite_dims_qk,
     split_seq_exponent,
 )
-from .workload import Request, RandomShapeGenerator, WorkloadConfig, sweep
+from .workload import (Request, RandomShapeGenerator, WorkloadConfig,
+                       conversation, generation, sweep)
 from .predictor import (
     AnalyticBackend,
     CachedPredictor,
@@ -39,7 +40,8 @@ __version__ = "0.1.0"
 __all__ = [
     "ShapeRewriter", "learn_scaling", "load_template", "parse_shape_from_name",
     "rewrite_dims", "rewrite_dims_qk", "split_seq_exponent",
-    "Request", "RandomShapeGenerator", "WorkloadConfig", "sweep",
+    "Request", "RandomShapeGenerator", "WorkloadConfig",
+    "conversation", "generation", "sweep",
     "AnalyticBackend", "CachedPredictor", "GeeBackend", "build_predictor",
     "KernelRecord", "RequestRecord", "Trace", "simulate",
 ]

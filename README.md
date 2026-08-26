@@ -153,6 +153,46 @@ Cache at *simulation* scope, not per pass.
 
 ---
 
+## Decode dynamics: the KV cache grows, so the shape moves
+
+A generation is not one decode call. It is a prefill, then N decode steps whose **KV cache grows by
+one token each time** — so every step is a different attention shape:
+
+```
+prefill   b x 1024 tokens      attn 1024 x 1024    square
+decode    ctx = 1024           attn    1 x 1024    strip
+decode    ctx = 1025           attn    1 x 1025    longer strip
+decode    ctx = 1026           attn    1 x 1026         ...
+```
+
+Attention work grows linearly across the generation while the projection GEMMs stay pinned at
+`batch` rows. That asymmetry is why a long conversation gets slower and hotter the further it runs.
+
+```python
+from dynshape import generation, conversation
+
+generation(batch=8, prompt_len=512, n_new_tokens=2000)   # one generation, step by step
+conversation([(500, 100), (20, 100)], batch=1)           # multi-turn; cache carries across turns
+```
+
+Measured over 2,000 decode steps (analytic backend, batch 8, prompt 512):
+
+| context | step time | avg power |
+|---|---|---|
+| 512 | 0.89 ms | 75 W |
+| 1408 | 1.22 ms | 84 W |
+| 2560 | 1.64 ms | 90 W |
+
+**Context bucketing is what keeps this tractable.** At `context_bucket=128` those 2,000 steps
+collapse to **94 distinct shapes with a 100% cache hit rate**; at `context_bucket=1` every step is
+its own shape and the cache is useless. Rounding is *up*, matching Vidur, whose
+`kv_cache_prediction_granularity` defaults to 64.
+
+`conversation()` shows the multi-turn asymmetry directly — turn 2 prefills only its 20 new tokens
+but its decode steps start from a 523-token cache: cheap to start, expensive to continue.
+
+---
+
 ## What this deliberately is not
 
 There is **no L0** (arrival process) and **no L1** (scheduler) here. No Poisson arrivals, no KV

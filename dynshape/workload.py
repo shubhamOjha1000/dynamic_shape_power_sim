@@ -27,7 +27,7 @@ everyone downstream.)
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -166,3 +166,73 @@ def sweep(batches: Sequence[int], seqlens: Sequence[int],
                 out.append(Request(idx=i, batch=int(b), seqlen=int(s), mode=mode))
                 i += 1
     return out
+
+
+def generation(batch: int, prompt_len: int, n_new_tokens: int,
+               context_bucket: int = 128, start_idx: int = 0,
+               include_prefill: bool = True) -> List[Request]:
+    """One autoregressive generation, step by step -- the decode dynamics.
+
+    A real generation is not one decode call. It is a prefill of the prompt,
+    then `n_new_tokens` decode steps whose **KV cache grows by one token each
+    time**, so every step is a slightly different shape:
+
+        prefill  b x 1024 tokens        attn 1024 x 1024   (square)
+        decode   ctx = 1024             attn    1 x 1024   (strip)
+        decode   ctx = 1025             attn    1 x 1025   longer strip
+        decode   ctx = 1026             attn    1 x 1026        ...
+
+    Attention work therefore grows linearly across the generation while the
+    projection GEMMs stay fixed at `batch` rows -- which is why a long
+    conversation gets slower and slightly hotter the further it runs.
+
+    `context_bucket` quantises the context length, so the shape changes once
+    every `context_bucket` tokens instead of every single token. Rounding is
+    **up**, matching Vidur, whose `kv_cache_prediction_granularity` defaults to
+    64 and rounds with `(x + g - 1) // g * g`. Set it to 1 for exact per-token
+    contexts -- correct, but it makes every step a distinct shape and collapses
+    the predictor cache (see `CachedPredictor`).
+    """
+    if prompt_len < 1:
+        raise ValueError("prompt_len must be >= 1")
+    if n_new_tokens < 1:
+        raise ValueError("n_new_tokens must be >= 1")
+
+    reqs: List[Request] = []
+    i = start_idx
+    if include_prefill:
+        reqs.append(Request(idx=i, batch=batch, seqlen=prompt_len, mode="prefill"))
+        i += 1
+
+    for step in range(n_new_tokens):
+        # After the prompt and `step` generated tokens, the cache holds
+        # prompt_len + step tokens, which is what this step attends over.
+        ctx = prompt_len + step
+        reqs.append(Request(idx=i, batch=batch,
+                            seqlen=quantise(ctx, context_bucket), mode="decode"))
+        i += 1
+    return reqs
+
+
+def conversation(turns: Sequence[Tuple[int, int]], batch: int = 1,
+                 context_bucket: int = 128) -> List[Request]:
+    """A multi-turn chat: each turn prefills only the new text, then generates.
+
+    `turns` is [(new_prompt_tokens, tokens_to_generate), ...]. The KV cache
+    carries across turns, so turn 2's prefill is short but its decode steps
+    start from an already-long context -- the shape asymmetry that makes
+    later turns cheap to start and expensive to continue.
+    """
+    reqs: List[Request] = []
+    ctx = 0
+    for new_tokens, n_gen in turns:
+        if new_tokens < 1 or n_gen < 1:
+            raise ValueError("each turn needs >= 1 prompt token and >= 1 generated token")
+        reqs.append(Request(idx=len(reqs), batch=batch, seqlen=new_tokens, mode="prefill"))
+        ctx += new_tokens
+        for step in range(n_gen):
+            reqs.append(Request(idx=len(reqs), batch=batch,
+                                seqlen=quantise(ctx + step, context_bucket),
+                                mode="decode"))
+        ctx += n_gen
+    return reqs
