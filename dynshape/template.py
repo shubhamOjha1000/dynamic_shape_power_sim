@@ -176,17 +176,30 @@ def rewrite_dims(
     s0: int,
     batch: int,
     seqlen: int,
+    seq_offset: int = 0,
 ) -> List[Entry]:
     """Rescale a traced template from (b0, s0) to (batch, seqlen).
 
-    Exact for prefill.  For decode use `rewrite_dims_qk` instead -- decode is a
-    different attention shape, not a rescaled one.
+    `seq_offset` shifts the sequence axis, so the law is
+
+        value = const * B^a * (S + offset)^b
+
+    Prefill needs no shift.  **Decode needs offset = 1**, measured rather than
+    assumed: tracing GPT-2 decode with a `seqlen`-token KV cache shows attention
+    over `seqlen + 1` keys, because the new token's own K/V are appended before
+    attention runs.  At a nominal context of 128 the attention `dimN` is 129, and
+    512 gives 513 -- affine in S, so a pure power law fits with an exponent of
+    0.9958 instead of 1 and `learn_scaling` refuses it.  Shifted by one it is
+    exactly 1.
     """
     out: List[Entry] = []
     for (q, op), r in zip(t_base, rules):
         nq = dict(q)
         for k, (a, b) in r.items():
-            nq[k] = _round_pos(q[k] * (batch / b0) ** a * (seqlen / s0) ** b)
+            nq[k] = _round_pos(
+                q[k] * (batch / b0) ** a
+                * ((seqlen + seq_offset) / (s0 + seq_offset)) ** b
+            )
         out.append((nq, op))
     return out
 
@@ -312,12 +325,24 @@ class ShapeRewriter:
     decode_rules: Optional[Rules] = None
     decode_b0: Optional[int] = None
     decode_s0: Optional[int] = None
+    #: Shift on decode's sequence axis, detected when the law is learned.
+    #: Measured as 1 for GPT-2 -- see `rewrite_dims`.
+    decode_seq_offset: int = 0
 
     # -- construction --------------------------------------------------------
 
     @staticmethod
-    def _learn_from_anchors(base_path: str, alt_batch_path: str, alt_seq_path: str):
-        """(base, rules, b0, s0) from three traces that move one input each."""
+    def _learn_from_anchors(base_path: str, alt_batch_path: str, alt_seq_path: str,
+                            seq_offsets: Sequence[int] = (0, 1)):
+        """(base, rules, b0, s0, mode, offset) from three traces.
+
+        `seq_offsets` are the shifts to try on the sequence axis, in order.  A
+        prefill template fits at 0; decode needs 1, because the token being
+        generated attends over `context + 1` keys.  The first shift that yields
+        integer exponents everywhere wins -- so the shift is *detected*, and if
+        none fits, the error from the last attempt propagates rather than a law
+        being invented.
+        """
         b0, s0, mode0 = parse_shape_from_name(base_path)
         b1, s1, mode1 = parse_shape_from_name(alt_batch_path)
         b2, s2, mode2 = parse_shape_from_name(alt_seq_path)
@@ -333,14 +358,21 @@ class ShapeRewriter:
             )
 
         base = load_template(base_path)
-        rules = learn_scaling(
-            base,
-            load_template(alt_batch_path),
-            load_template(alt_seq_path),
-            batch_ratio=b1 / b0,
-            seq_ratio=s2 / s0,
-        )
-        return base, rules, b0, s0, mode0
+        alt_b = load_template(alt_batch_path)
+        alt_s = load_template(alt_seq_path)
+
+        last: Optional[Exception] = None
+        for off in seq_offsets:
+            try:
+                rules = learn_scaling(
+                    base, alt_b, alt_s,
+                    batch_ratio=b1 / b0,
+                    seq_ratio=(s2 + off) / (s0 + off),
+                )
+                return base, rules, b0, s0, mode0, off
+            except ValueError as e:
+                last = e
+        raise last
 
     @classmethod
     def from_files(cls, base_path: str, alt_batch_path: str, alt_seq_path: str,
@@ -352,16 +384,22 @@ class ShapeRewriter:
         `--mode decode`: (base, alt_batch, alt_seq). Supply it and decode stops
         being inferred -- see the class docstring.
         """
-        base, rules, b0, s0, mode0 = cls._learn_from_anchors(
-            base_path, alt_batch_path, alt_seq_path)
+        base, rules, b0, s0, mode0, _off = cls._learn_from_anchors(
+            base_path, alt_batch_path, alt_seq_path, seq_offsets=(0,))
         if mode0 != "prefill":
             raise ValueError("the base template must be a prefill trace")
 
         d_base = d_rules = d_b0 = d_s0 = None
+        d_off = 0
         if decode_paths is not None:
             if len(decode_paths) != 3:
                 raise ValueError("decode_paths needs exactly three anchor traces")
-            d_base, d_rules, d_b0, d_s0, d_mode = cls._learn_from_anchors(*decode_paths)
+            d_base, d_rules, d_b0, d_s0, d_mode, d_off = cls._learn_from_anchors(
+                *decode_paths)
+            if d_off:
+                print(f"[dynshape] decode's sequence axis is shifted by +{d_off}: "
+                      f"a token generated with a context of S attends over S+{d_off} "
+                      f"keys, because its own K/V are appended before attention.")
             if d_mode != "decode":
                 raise ValueError(f"decode_paths must be decode traces, got {d_mode!r}")
             if len(d_base) != len(base):
@@ -372,7 +410,7 @@ class ShapeRewriter:
 
         return cls(base=base, rules=rules, b0=b0, s0=s0, model=model,
                    decode_base=d_base, decode_rules=d_rules,
-                   decode_b0=d_b0, decode_s0=d_s0)
+                   decode_b0=d_b0, decode_s0=d_s0, decode_seq_offset=d_off)
 
     @classmethod
     def from_dir(cls, template_dir: str, model: str = "gpt2",
@@ -435,9 +473,16 @@ class ShapeRewriter:
                 # Measured decode law: decode has its own template and its own
                 # exponents, so the query/key split is never consulted.
                 return rewrite_dims(self.decode_base, self.decode_rules,
-                                    self.decode_b0, self.decode_s0, batch, seqlen)
+                                    self.decode_b0, self.decode_s0, batch, seqlen,
+                                    seq_offset=self.decode_seq_offset)
+            # seq_k is context + 1, not context: the generated token's own K/V are
+            # appended before attention, so it attends over one more key than the
+            # cache holds. Measured -- tracing GPT-2 decode at a nominal context of
+            # 128 gives attention dimN 129, softmax dim 129 and a B*heads*1*129
+            # score tensor. Getting this wrong misses 48 of 242 entries, every one
+            # of them an attention shape.
             return rewrite_dims_qk(self.base, self.rules, self.b0, self.s0,
-                                   batch, seq_q=1, seq_k=seqlen)
+                                   batch, seq_q=1, seq_k=seqlen + 1)
         raise ValueError(f"mode must be 'prefill' or 'decode', got {mode!r}")
 
     @property

@@ -72,9 +72,24 @@ Prefill attention is a **square** — every token attends to every token. Decode
 **strip** — one query row against the whole KV cache. No exponent turns a square into a strip:
 
 ```
-prefill:  attn GEMM   M = S,  N = S        square
-decode:   attn GEMM   M = 1,  N = context  strip
+prefill:  attn GEMM   M = S,  N = S            square
+decode:   attn GEMM   M = 1,  N = context + 1  strip
 ```
+
+**The `+1` is measured, not assumed.** The generated token's own K/V are appended to the cache
+before attention runs, so it attends over one more key than the cache holds. Tracing GPT-2 decode
+showed 48 of 242 entries differing from the original inferred rule — 12 blocks × 4 attention
+entries, every one off by exactly one token:
+
+| | inferred | measured |
+|---|---|---|
+| attention `dimN` | 128 | **129** |
+| softmax `dim` | 128 | **129** |
+| score tensor `dim` | 12288 | **12384** (= 96 × 129) |
+
+That also makes decode's sequence axis **affine**, so the law is `const × B^a × (S + offset)^b`.
+A pure power law in `S` fits with an exponent of 0.9958 rather than 1, and `learn_scaling` refuses
+it — correctly. The shift is detected when the law is learned, never configured.
 
 So the sequence exponent `b` is **split** into two independent axes — query length `Sq` and key
 length `Sk` — giving `value = const × B^a × Sq^p × Sk^q` with `p + q = b`:
@@ -148,11 +163,19 @@ the inferred split was wrong about more than exponents.
 
 ### What is **not** validated
 
-**Decode has no ground truth anywhere.** All 90 workload files shipped with the EnergAIzer
-artifact are `modeprefill` — `grep -c decode` returns 0. The decode rule is derived from what
-`run_model.get_input()` actually feeds the model (one token per sequence plus a length-`seqlen`
-KV cache) and is checked for *internal* consistency only. Treat decode numbers as structurally
-sound and empirically unconfirmed.
+**No decode ground truth ships with the artifact.** All 90 workload files are `modeprefill` —
+`grep -c decode` returns 0 — even though the authors' own `run_gpt2.sh` has `MODE="prefill decode"`.
+
+Tracing it (see the notebook below) settled three things that were previously assumptions:
+
+| question | answer |
+|---|---|
+| does decode run the same 242 kernels in the same order? | **yes** — op sequence identical to prefill |
+| was the inferred query/key split right? | **no** — off by one token on 48 of 242 entries, now corrected |
+| does a decode law learned from 3 anchors generalise? | **yes** — reproduces a held-out 4th trace exactly |
+
+Until those traces are committed to `templates/gpt2/`, `decode_source` reports `inferred`: the
+shapes are correct but derived from the prefill law rather than read from decode measurements.
 
 Also assumed, and stated rather than tested: kernel costs are **additive** within a pass (no
 overlap, no memory contention, no cache carry-over); the template is traced from **HuggingFace**,

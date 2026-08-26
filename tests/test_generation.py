@@ -60,7 +60,8 @@ def test_each_step_really_is_a_different_attention_shape(rewriter):
         assert proj["dimM"] == 4, "projection stays at batch rows the whole way"
         seen.append(qk["dimN"])
 
-    assert seen == [1000, 1001, 1002, 1003], "the KV strip must lengthen each step"
+    # context + 1 keys at each step -- the token attends over its own K/V too.
+    assert seen == [1001, 1002, 1003, 1004], "the KV strip must lengthen each step"
 
 
 def test_decode_gets_slower_and_hotter_as_context_grows(rewriter):

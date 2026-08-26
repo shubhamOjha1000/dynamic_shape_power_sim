@@ -74,7 +74,13 @@ def test_decode_token_count_is_one_per_sequence(rewriter, batch, context):
 
 @pytest.mark.parametrize("batch,context", [(1, 128), (4, 1000), (32, 2048)])
 def test_decode_attention_is_a_strip_not_a_square(rewriter, batch, context):
-    """prefill: M = S, N = S.  decode: M = 1, N = context."""
+    """prefill: M = S, N = S.  decode: M = 1, N = context + 1.
+
+    The +1 is MEASURED, not assumed: the generated token's own K/V are appended
+    to the cache before attention runs, so it attends over one more key than the
+    cache holds.  A GPT-2 decode trace at a nominal context of 128 shows
+    attention dimN = 129 and softmax dim = 129.
+    """
     dec = rewriter.expand(batch, context, "decode")
     attn = [q for q, op in dec if op[0] == "gemm" and q.get("batch") == batch * HEADS]
     assert attn, "no batched attention GEMMs found"
@@ -82,13 +88,15 @@ def test_decode_attention_is_a_strip_not_a_square(rewriter, batch, context):
     for q in attn:
         assert q["dimM"] == 1, f"decode query length must be 1, got {q['dimM']}"
 
-    # Q.K^T : (1 x head_dim) @ (head_dim x context)
-    qk = [q for q in attn if q["dimK"] == HEAD_DIM]
-    assert qk and all(q["dimN"] == context for q in qk)
+    keys = context + 1
 
-    # scores.V : (1 x context) @ (context x head_dim)
+    # Q.K^T : (1 x head_dim) @ (head_dim x keys)
+    qk = [q for q in attn if q["dimK"] == HEAD_DIM]
+    assert qk and all(q["dimN"] == keys for q in qk)
+
+    # scores.V : (1 x keys) @ (keys x head_dim)
     av = [q for q in attn if q["dimN"] == HEAD_DIM]
-    assert av and all(q["dimK"] == context for q in av)
+    assert av and all(q["dimK"] == keys for q in av)
 
     assert len(qk) == len(av) == HEADS, "one of each per transformer block"
 
@@ -98,14 +106,15 @@ def test_decode_softmax_and_mask_match_the_attention_shape(rewriter, batch, cont
     """Cross-entry consistency: what attention produces is what softmax consumes."""
     dec = rewriter.expand(batch, context, "decode")
 
+    keys = context + 1
     sm = [q for q, op in dec if op[0] == "softmax"]
-    assert sm and all(q["dim"] == context for q in sm), "softmax reduces over context"
+    assert sm and all(q["dim"] == keys for q in sm), "softmax reduces over the keys"
     assert all(q["batch"] == batch * HEADS for q in sm), "one row per head per sequence"
 
     # The score tensor carried by the (1,1) elementwise op is B*h*Sq*Sk.
     scores = [q["dim"] for q, op in dec if op[0] == "elementwise"
-              if q["dim"] == batch * HEADS * context]
-    assert scores, "no B*heads*1*context score tensor found in decode"
+              if q["dim"] == batch * HEADS * keys]
+    assert scores, "no B*heads*1*(context+1) score tensor found in decode"
 
 
 def test_decode_is_far_cheaper_than_prefill_at_the_same_length(rewriter):
@@ -235,3 +244,42 @@ def test_anchor_modes_must_agree(tmp_path):
     with pytest.raises(ValueError, match="same mode"):
         ShapeRewriter._learn_from_anchors(template_path(8, 128), paths[1],
                                           template_path(8, 512))
+
+
+def test_the_key_axis_is_context_plus_one(rewriter):
+    """Pin the +1 on its own, with its provenance.
+
+    Tracing GPT-2 decode found 48 of 242 entries differing from the inferred
+    rule -- 12 blocks x 4 attention entries -- every one of them off by exactly
+    one token. This is the assertion that keeps that from regressing.
+    """
+    for ctx in (1, 127, 128, 1000, 4096):
+        dec = rewriter.expand(4, ctx, "decode")
+        qk = next(q for q, op in dec
+                  if op[0] == "gemm" and q.get("batch") == 4 * HEADS
+                  and q["dimK"] == HEAD_DIM)
+        assert qk["dimN"] == ctx + 1, f"context {ctx} must give {ctx + 1} keys"
+
+
+def test_measured_decode_law_detects_the_offset(tmp_path, rewriter):
+    """A decode law learned from real traces must recover offset = 1 itself.
+
+    Without it `learn_scaling` refuses -- 129 -> 513 is affine in S, giving an
+    exponent of 0.9958 rather than 1 -- which is exactly what the first real
+    decode traces produced.
+    """
+    import json
+    import shutil
+
+    for b, s in [(8, 128), (16, 128), (8, 512)]:
+        shutil.copy(template_path(b, s), str(tmp_path))
+        json.dump([[q, list(op)] for q, op in rewriter.expand(b, s, "decode")],
+                  open(os.path.join(str(tmp_path),
+                       f"gpt2model_gpt2_pbf16_b{b}_s{s}_modedecode.json"), "w"))
+
+    rw = ShapeRewriter.from_dir(str(tmp_path))
+    assert rw.decode_source == "measured"
+    assert rw.decode_seq_offset == 1, "the +1 must be detected, not configured"
+
+    # And it must generalise to a shape none of the three anchors covers.
+    assert rw.expand(16, 512, "decode") == rewriter.expand(16, 512, "decode")
