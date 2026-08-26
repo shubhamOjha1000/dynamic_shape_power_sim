@@ -1,0 +1,14 @@
+# The dynamic-shape layer itself needs almost nothing.
+numpy>=1.20
+pandas>=1.2
+matplotlib>=3.3
+pytest>=6.0
+
+# Only needed for the real EnergAIzer backend (`gee`); the analytic fallback
+# runs without them.
+# scipy
+# cvxpy
+# pyyaml
+# opt-einsum
+# tqdm
+# scikit-learn
