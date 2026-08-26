@@ -128,6 +128,14 @@ python run_model.py ... --batch 8  --seqlen 512 --mode decode ...   # -> context
 python parse_trace.py --trace_path ... --parsed_save_to templates/gpt2/
 ```
 
+**A ready-made notebook does all of this:**
+[`notebooks/Trace_GPT2_Decode_Colab.ipynb`](notebooks/Trace_GPT2_Decode_Colab.ipynb). It clones the
+artifact, reconstructs the missing `workload_config/` (which does not ship), traces four decode
+shapes, and grades the inferred rule against the measurement. It opens with a **control** — retracing
+a template that already exists and asserting an exact match — so a broken pipeline is caught on a
+case with a known answer rather than misread as a decode finding. A free Colab CPU or T4 is enough;
+tracing records op names and tensor shapes, not timings.
+
 `from_dir` picks up any `..._modedecode.json` automatically. Check which law is in play:
 
 ```python
