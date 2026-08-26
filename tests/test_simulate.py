@@ -197,3 +197,26 @@ def test_empty_trace_does_not_divide_by_zero():
     t = Trace()
     assert t.total_time_ms == 0 and t.avg_power_w == 0 and t.peak_power_w == 0
     assert t.power_steps() == ([], [])
+
+
+def test_max_ms_actually_zooms(small_trace):
+    """A regression guard: an unclipped shading span autoscales the axis back
+    out to the full request, so the zoom silently does nothing."""
+    import matplotlib.pyplot as plt
+    from dynshape.plot import plot_power_timeline
+
+    assert small_trace.total_time_ms > 25, "fixture is too short to test a zoom"
+    _, ax = plt.subplots()
+    plot_power_timeline(small_trace, ax=ax, max_ms=25)
+    lo, hi = ax.get_xlim()
+    assert (lo, hi) == (0, 25), f"expected the axis clipped to the window, got {(lo, hi)}"
+
+    line = ax.lines[0]
+    assert line.get_xdata()[-1] <= 25 + 1e-9, "the staircase runs past the window"
+    assert line.get_xdata()[-1] == 25, "the staircase stops short of the window edge"
+    for patch in ax.patches:
+        # axvspan returns a Polygon on older matplotlib and a Rectangle on newer
+        # ones, so read the vertices rather than the rectangle accessors.
+        right = max(x for x, _ in patch.get_xy())
+        assert right <= 25 + 1e-9, f"an unclipped shading span reaches {right}"
+    plt.close("all")

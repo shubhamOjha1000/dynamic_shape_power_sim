@@ -56,16 +56,29 @@ def plot_power_timeline(trace, ax=None, max_ms: Optional[float] = None,
     ts, ps = np.asarray(ts), np.asarray(ps)
     if max_ms is not None:
         keep = ts <= max_ms
-        ts, ps = ts[keep], ps[keep]
+        if keep.any():
+            # Extend the last surviving step to the edge of the window, so the
+            # staircase does not stop short of the axis it is drawn on.
+            ts = np.append(ts[keep], max_ms)
+            ps = np.append(ps[keep], ps[keep][-1])
+        else:
+            ts, ps = ts[:0], ps[:0]
 
     if shade_requests:
         for r in trace.requests:
             if max_ms is not None and r.t_start_ms > max_ms:
                 break
-            ax.axvspan(r.t_start_ms, r.t_start_ms + r.time_ms,
+            end = r.t_start_ms + r.time_ms
+            if max_ms is not None:
+                # Clip, not skip: an unclipped span autoscales the axis back out
+                # to the full request and silently undoes the zoom.
+                end = min(end, max_ms)
+            ax.axvspan(r.t_start_ms, end,
                        color=_MODE_COLOR.get(r.mode, "#888"), alpha=0.10, lw=0)
 
     ax.step(ts, ps, where="post", lw=0.9, color="#1b1b1b")
+    if max_ms is not None:
+        ax.set_xlim(0, max_ms)
     ax.axhline(trace.avg_power_w, ls="--", lw=1.0, color="#e67e22",
                label=f"trace average {trace.avg_power_w:.0f} W")
 
@@ -106,9 +119,18 @@ def plot_request_scatter(trace, ax=None, annotate_top: int = 4,
                    edgecolor="white", lw=0.5, label=f"{mode} (n={len(rs)})")
 
     if annotate_top and trace.requests:
-        for r in sorted(trace.requests, key=lambda r: r.time_ms)[-annotate_top:]:
+        # The longest passes cluster at the right edge, so a fixed offset stacks
+        # their labels on top of each other -- fan them out instead.
+        top = sorted(trace.requests, key=lambda r: r.time_ms)[-annotate_top:]
+        for n, r in enumerate(top):
+            # Always downward: the longest passes are also the hottest, so they
+            # sit near the top of the axes where an upward label hits the title.
+            dy = -(9 + 11 * n)
             ax.annotate(f"b{r.batch} s{r.seqlen}", (r.time_ms, r.avg_power_w),
-                        textcoords="offset points", xytext=(6, 5), fontsize=7.5, alpha=0.85)
+                        textcoords="offset points", xytext=(-8, dy), fontsize=7.5,
+                        alpha=0.85, ha="right",
+                        arrowprops=dict(arrowstyle="-", lw=0.5, alpha=0.35,
+                                        color="#555", shrinkA=0, shrinkB=3))
 
     ax.set_xscale("log")
     ax.set_xlabel("forward-pass time (ms, log)")
