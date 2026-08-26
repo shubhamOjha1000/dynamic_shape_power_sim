@@ -252,8 +252,12 @@ def plot_kernel_zoom(trace: EngineTrace, ax=None, max_ms: Optional[float] = None
                 ha="center", va="center", transform=ax.transAxes)
         return ax
 
+    # The recording window opens at the first iteration, not at t=0 -- under
+    # light load the engine idles first, so anchoring the axis at zero would
+    # squeeze every recorded kernel into a sliver at the right-hand edge.
+    start = min(s.t_start_ms for s in trace.segments)
     recorded = max(s.t_end_ms for s in trace.segments)
-    limit = min(max_ms, recorded) if max_ms is not None else recorded
+    limit = min(start + max_ms, recorded) if max_ms is not None else recorded
     segs = sorted((s for s in trace.segments if s.t_start_ms < limit),
                   key=lambda s: s.t_start_ms)
 
@@ -270,14 +274,16 @@ def plot_kernel_zoom(trace: EngineTrace, ax=None, max_ms: Optional[float] = None
     for i in trace.iterations:
         if i.t_start_ms >= limit:
             break
-        ax.axvline(i.t_start_ms, color="#aaaaaa", lw=0.4, alpha=0.6, zorder=0)
+        if i.t_start_ms >= start:
+            ax.axvline(i.t_start_ms, color="#aaaaaa", lw=0.4, alpha=0.6, zorder=0)
 
-    ax.set_xlim(0, limit)
+    ax.set_xlim(start, limit)
     ax.set_ylim(bottom=0)
     ax.set_xlabel("wall clock (ms)")
     ax.set_ylabel("power (W)")
-    ax.set_title(f"Kernel-level power -- {len(segs)} kernels in the first "
-                 f"{limit:.0f} ms (grey lines = iteration boundaries)")
+    ax.set_title(f"Kernel-level power -- {len(segs)} kernels over "
+                 f"{limit - start:.0f} ms from the first iteration "
+                 f"(grey lines = iteration boundaries)")
     ax.grid(alpha=0.25)
     return ax
 

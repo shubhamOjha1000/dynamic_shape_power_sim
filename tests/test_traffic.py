@@ -67,15 +67,29 @@ def test_spawn_seeds_is_deterministic_and_distinct():
 
 
 def test_pd_ratio_moves_the_prefill_share():
-    """One number decides compute-bound vs memory-bound, and therefore roughly
-    a factor of two in power."""
+    """One number decides compute-bound vs memory-bound.
+
+    Note what the knob can and cannot do. All four generators draw a **total**
+    size and then split it, so the total token count barely moves; only the
+    split does. Prefill's share goes from `1/(1+0.5)` of the total to
+    `19/(1+19)`, which is a ceiling of 2.85x -- while decode's share collapses by
+    13x in the other direction. The asymmetry is the point: a prefill-heavy
+    workload is not one that does much more work, it is one that does the *same*
+    work compute-bound instead of memory-bound.
+    """
     story = traffic_summary(generate_traffic(TrafficConfig(
         num_requests=300, seed=2, prefill_to_decode_ratio=0.5)))
     summarise = traffic_summary(generate_traffic(TrafficConfig(
         num_requests=300, seed=2, prefill_to_decode_ratio=19.0)))
     assert story["pd_ratio_median"] < 1.0
     assert summarise["pd_ratio_median"] > 10.0
-    assert summarise["total_prefill_tokens"] > 3 * story["total_prefill_tokens"]
+
+    # prefill share is r/(1+r): 0.5/1.5 at r=0.5, 19/20 at r=19 -> 2.85x
+    ceiling = (19 / 20) / (0.5 / 1.5)
+    prefill_gain = summarise["total_prefill_tokens"] / story["total_prefill_tokens"]
+    decode_drop = story["total_decode_tokens"] / summarise["total_decode_tokens"]
+    assert 0.9 * ceiling < prefill_gain <= 1.05 * ceiling
+    assert decode_drop > 8.0
 
 
 def test_prefix_cache_reduces_executed_prefill_work():

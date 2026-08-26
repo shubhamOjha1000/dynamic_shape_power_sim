@@ -66,10 +66,15 @@ class EngineConfig:
     gap_ms: float = GAP_MS
     idle_w: float = IDLE_W
 
-    #: Per-kernel rows are only kept for the first N ms of simulated time.  A
-    #: busy run is millions of kernels; the zoomed staircase you would actually
-    #: plot is the first few hundred milliseconds.  None keeps everything, 0
-    #: keeps none.  Per-iteration records are always kept.
+    #: Per-kernel rows are only kept for the first N ms **after the first
+    #: iteration starts**.  A busy run is millions of kernels; the zoomed
+    #: staircase you would actually plot is the opening slice.  None keeps
+    #: everything, 0 keeps none.  Per-iteration records are always kept.
+    #:
+    #: Measured from the first iteration rather than from t=0 on purpose: under
+    #: light load the engine idles for hundreds of milliseconds before the first
+    #: request arrives, and a window anchored at zero can close before any work
+    #: has happened at all -- producing an empty zoom panel with no warning.
     record_kernels_until_ms: Optional[float] = 250.0
 
     skip_unsupported: bool = True
@@ -317,10 +322,14 @@ def run_engine(
     cursor = 0
     n_done = 0
     it = 0
+    first_iteration_ms: Optional[float] = None
 
     def record_kernels_now() -> bool:
         lim = cfg.record_kernels_until_ms
-        return lim is None or clock < lim
+        if lim is None:
+            return True
+        anchor = clock if first_iteration_ms is None else first_iteration_ms
+        return (clock - anchor) < lim
 
     while n_done < len(pending):
         if it >= cfg.max_iterations:
@@ -361,6 +370,9 @@ def run_engine(
                     op="idle", iteration=-1))
                 clock = next_ms
             continue
+
+        if first_iteration_ms is None:
+            first_iteration_ms = clock
 
         batch.on_schedule(clock / 1000.0)
         pieces = batch.pieces

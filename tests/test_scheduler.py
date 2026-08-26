@@ -97,11 +97,21 @@ def test_the_busier_the_system_the_less_budget_survives_for_prefill():
     def first_chunk(n_chatters):
         s = sched(chunk_size=512, max_num_seqs=256)
         for _ in range(n_chatters):
-            s.add_request(req(20, d=100))
-        run(s, n_chatters + 2)
+            # Long generations, so nobody finishes during the warm-up below --
+            # an earlier version of this test used d=100 and ran n+2 warm-up
+            # iterations, so at n=200 the first chatters admitted had already
+            # completed and left before the measurement was taken.
+            s.add_request(req(20, d=5000))
+        # 20-token prompts against a 512-token budget: ~25 admitted per
+        # iteration, so 20 iterations is enough to get 200 of them decoding.
+        run(s, 20)
+        assert s.num_running == n_chatters, 'warm-up did not admit everyone'
         s.add_request(req(2000, d=5, t=9.0))
         return s.get_next_batch().num_prefill_tokens
 
+    assert first_chunk(2) == 512 - 2
+    assert first_chunk(40) == 512 - 40
+    assert first_chunk(200) == 512 - 200
     assert first_chunk(2) > first_chunk(40) > first_chunk(200)
 
 

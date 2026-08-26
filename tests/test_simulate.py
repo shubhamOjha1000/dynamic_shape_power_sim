@@ -215,8 +215,15 @@ def test_max_ms_actually_zooms(small_trace):
     assert line.get_xdata()[-1] <= 25 + 1e-9, "the staircase runs past the window"
     assert line.get_xdata()[-1] == 25, "the staircase stops short of the window edge"
     for patch in ax.patches:
-        # axvspan returns a Polygon on older matplotlib and a Rectangle on newer
-        # ones, so read the vertices rather than the rectangle accessors.
-        right = max(x for x, _ in patch.get_xy())
+        # axvspan returns a Polygon on matplotlib < 3.9 and a Rectangle on 3.9+.
+        # Both have `get_xy`, which is why the previous version of this looked
+        # safe -- but Polygon.get_xy() is an (N, 2) vertex array while
+        # Rectangle.get_xy() is a single (x, y) anchor, so unpacking it raised
+        # `cannot unpack non-iterable float object` on newer matplotlib. Branch
+        # on the accessor that only Rectangle has.
+        if hasattr(patch, "get_width"):
+            right = patch.get_x() + patch.get_width()
+        else:
+            right = max(x for x, _ in patch.get_xy())
         assert right <= 25 + 1e-9, f"an unclipped shading span reaches {right}"
     plt.close("all")

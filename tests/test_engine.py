@@ -56,15 +56,55 @@ def test_iterations_tile_the_busy_time_without_gaps_or_overlap(rewriter, predict
 # -- the thing this layer was built for --------------------------------------
 
 def test_prefill_and_decode_really_are_batched_together(rewriter, predictor):
-    """The headline requirement: mixed iterations, not alternating ones."""
-    reqs = tiny_traffic(24, qps=60.0, prefill_tokens=400, decode_tokens=40)
+    """The headline requirement: mixed iterations, not alternating ones.
+
+    The threshold is deliberately low and the reason is worth stating, because
+    it is easy to read a small number here as a broken scheduler. GPT-2 prefills
+    a 400-token prompt in **one** iteration, while the same request then spends
+    40 iterations decoding. So prefill can only ever occupy a few percent of
+    iterations, and the mixed fraction is bounded by that -- not by how well the
+    scheduler mixes. What proves mixing works is that prefill iterations carry
+    decodes *whenever any request is decoding*, which is the second assertion.
+    """
+    reqs = tiny_traffic(24, qps=200.0, prefill_tokens=400, decode_tokens=40)
     trace = run_engine(reqs, rewriter, predictor, small_engine())
+
+    with_prefill = [i for i in trace.iterations if i.prefill_chunks > 0]
     mixed = [i for i in trace.iterations if i.is_mixed]
     assert mixed, "no iteration carried prefill and decode at once"
-    assert trace.summary()["mixed_fraction"] > 0.05
+
+    # Of the iterations that do carry prefill, most must also carry decode --
+    # that is the decode-first rule actually firing.
+    assert len(mixed) / len(with_prefill) > 0.5
     for i in mixed:
         assert i.decode_batch > 0 and i.prefill_chunks > 0
         assert i.total_tokens == i.prefill_tokens + i.decode_tokens
+
+
+def test_the_engine_processes_exactly_the_work_the_workload_asked_for(
+        rewriter, predictor):
+    """Conservation, summed over the whole run.
+
+    Every prompt token is prefilled exactly once and every decode token is
+    generated exactly once. If the scheduler ever double-issued or dropped an
+    iteration's work, these two sums are where it shows up.
+
+    Restated for a run with **no restarts**, and the run is asserted to have
+    none: a restart rewrites `num_prefill_tokens` in place, so the identity
+    needs the request's whole history rather than its final state, and a test
+    that quietly accommodated that would stop being a check on anything.
+    """
+    reqs = tiny_traffic(20, qps=200.0, prefill_tokens=600, decode_tokens=30)
+    trace = run_engine(reqs, rewriter, predictor, small_engine())
+    assert all(r.num_restarts == 0 for r in trace.requests)
+
+    prefill_issued = sum(i.prefill_tokens for i in trace.iterations)
+    decode_issued = sum(i.decode_tokens for i in trace.iterations)
+
+    assert prefill_issued == sum(r.num_prefill_tokens for r in trace.requests)
+    # The pass that finishes a prompt emits token one, so it is not a decode
+    # step -- hence one fewer decode iteration per request than tokens produced.
+    assert decode_issued == sum(r.num_generated_tokens - 1 for r in trace.requests)
 
 
 def test_a_mixed_iteration_costs_more_than_either_half_alone(rewriter, predictor):
