@@ -35,13 +35,58 @@ from .predictor import (
 )
 from .simulate import KernelRecord, RequestRecord, Trace, simulate
 
-__version__ = "0.1.0"
+# -- L0/L1: a real serving engine ------------------------------------------
+#
+# Everything above this line prices a *shape*.  Everything below decides which
+# shapes a real engine would actually produce, and when.
+#
+#     from dynshape import (TrafficConfig, generate_traffic, SchedulerConfig,
+#                           EngineConfig, run_engine)
+#     from dynshape.engine_plot import plot_engine_dashboard
+#
+#     reqs  = generate_traffic(TrafficConfig(interval="gamma", qps=6, cv=2.0,
+#                                            length="zipf", num_requests=200))
+#     rw    = ShapeRewriter.from_dir("templates/gpt2")
+#     pred  = build_predictor(force_analytic=True)
+#     trace = run_engine(reqs, rw, pred, EngineConfig())
+#     plot_engine_dashboard(trace)
+
+from .arrival import (GammaInterval, IntervalGenerator, PoissonInterval,
+                      StaticInterval, TraceInterval, piecewise_poisson)
+from .lengths import (FixedLength, LengthGenerator, TraceLength, UniformLength,
+                      ZipfGenerator, ZipfLength)
+from .entities import Batch, Piece, SimRequest, reset_ids
+from .traffic import TrafficConfig, generate_traffic, spawn_seeds, traffic_summary
+from .kvcache import (BlockAllocator, HardwareConfig, MemoryPlanner, ModelConfig)
+from .scheduler import ChunkedPrefillScheduler, SchedulerConfig
+from .mixed import (attention_mask, build_iteration_kernels,
+                    build_iteration_kernels_tagged, fusible_mask,
+                    iteration_token_shapes, mixed_report)
+from .engine import EngineConfig, EngineTrace, IterationRecord, Segment, run_engine
+
+__version__ = "0.2.0"
 
 __all__ = [
+    # L2 -- dynamic shapes
     "ShapeRewriter", "learn_scaling", "load_template", "parse_shape_from_name",
     "rewrite_dims", "rewrite_dims_qk", "split_seq_exponent",
     "Request", "RandomShapeGenerator", "WorkloadConfig",
     "conversation", "generation", "sweep",
     "AnalyticBackend", "CachedPredictor", "GeeBackend", "build_predictor",
     "KernelRecord", "RequestRecord", "Trace", "simulate",
+    # L0 -- workload
+    "IntervalGenerator", "StaticInterval", "PoissonInterval", "GammaInterval",
+    "TraceInterval", "piecewise_poisson",
+    "LengthGenerator", "FixedLength", "UniformLength", "ZipfLength",
+    "TraceLength", "ZipfGenerator",
+    "TrafficConfig", "generate_traffic", "traffic_summary", "spawn_seeds",
+    # L1 -- serving engine
+    "SimRequest", "Batch", "Piece", "reset_ids",
+    "ModelConfig", "HardwareConfig", "MemoryPlanner", "BlockAllocator",
+    "SchedulerConfig", "ChunkedPrefillScheduler",
+    # L2 for mixed batches
+    "build_iteration_kernels", "build_iteration_kernels_tagged",
+    "fusible_mask", "attention_mask", "mixed_report", "iteration_token_shapes",
+    # the loop
+    "EngineConfig", "EngineTrace", "IterationRecord", "Segment", "run_engine",
 ]

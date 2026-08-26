@@ -261,15 +261,88 @@ but its decode steps start from a 523-token cache: cheap to start, expensive to 
 
 ---
 
-## What this deliberately is not
+## L0 and L1: a real serving engine
 
-There is **no L0** (arrival process) and **no L1** (scheduler) here. No Poisson arrivals, no KV
-admission, no chunked prefill, no preemption. Those layers decide *which* shapes a real engine
-would produce; [`dynshape/workload.py`](dynshape/workload.py) just emits a varied spread so the
-dynamic-shape machinery has something to chew on.
+Everything above prices a *shape*. Everything here decides **which shapes a real engine would
+actually produce, and when** — and the answer is that prefill and decode happen in the *same*
+forward pass.
 
-Swapping that one file for a real Vidur timeline **is** the entire L0/L1 integration — everything
-downstream of it stays exactly as written.
+```python
+from dynshape import (TrafficConfig, generate_traffic, SchedulerConfig,
+                      EngineConfig, run_engine, ShapeRewriter, build_predictor)
+from dynshape.engine_plot import plot_engine_dashboard
+
+reqs  = generate_traffic(TrafficConfig(interval="gamma", qps=6, cv=2.0,   # bursty
+                                       length="zipf", theta=0.85,        # long-tailed
+                                       num_requests=120, seed=0))
+trace = run_engine(reqs, ShapeRewriter.from_dir("templates/gpt2"),
+                   build_predictor(force_analytic=True), EngineConfig())
+plot_engine_dashboard(trace)
+```
+
+| module | layer | what it decides | ported from |
+|---|---|---|---|
+| [`arrival.py`](dynshape/arrival.py) | L0 | when the next request arrives | Vidur — `static`, `poisson`, `gamma`, `trace` |
+| [`lengths.py`](dynshape/lengths.py) | L0 | how big it is | Vidur — `fixed`, `uniform`, `zipf`, `trace` |
+| [`traffic.py`](dynshape/traffic.py) | L0 | the two composed, with isolated RNGs | Vidur's `SyntheticRequestGenerator` |
+| [`kvcache.py`](dynshape/kvcache.py) | L1 | how big the KV pool is, and who holds it | Vidur `MemoryPlanner` + block allocator |
+| [`scheduler.py`](dynshape/scheduler.py) | L1 | who is in this batch | FSTS / vLLM V1 decode-first chunked prefill |
+| [`mixed.py`](dynshape/mixed.py) | L2 | what kernels a **mixed** batch launches | new |
+| [`engine.py`](dynshape/engine.py) | — | the run loop | new |
+
+Multi-replica routing is deliberately out of scope: one replica.
+
+### The scheduler, in two rules
+
+```
+decodes = [every running request whose prefill is done]   # protected, off the top
+budget  = chunk_size - len(decodes)                       # what is left
+prefill = fills the remainder, sliced to fit
+```
+
+Existing users are protected; new users are sacrificed. Because decodes come off the top, the
+busier the system the less budget survives for prefill — at 1800 chatters a 4000-token prompt
+takes 17 iterations instead of 2. For power it means every iteration carries **both**
+compute-bound prefill and memory-bound decode instead of alternating between them: same energy,
+lower peak, flatter ramp.
+
+### What fuses in a mixed batch, and what cannot
+
+The 242 template entries split into two classes, and the split is **derived from the learned
+exponents** rather than hard-coded per kernel family:
+
+| | rule | count | why |
+|---|---|---|---|
+| **fusible** | every field has `a == b`, so it depends only on `B·S` | **194** | a linear layer sees a bag of token rows and does not care which request each came from |
+| **per request** | some field has `a ≠ b` | **48** | attention cares about nothing else |
+
+Set `B=1, S=total_tokens` and the fusible entries are **exact, not approximated** — emitting one
+GEMM at the summed token count is strictly more faithful than emitting one per request, and costs
+nothing. The 48 are 12 blocks × 4 attention kernels: the same 48 the decode `+1` correction
+touched, which is a useful independent confirmation of both.
+
+Attention cannot be fused this way. vLLM issues one ragged `flash_attn_varlen_func` launch whose
+shape is a pair of offset arrays; EnergAIzer's LUT is keyed on rectangles and has no varlen entry.
+Under **eager** attention there is nothing to lose, which is what makes this the self-consistent
+choice for v1.
+
+### Preemption is the interesting event
+
+The KV accounting comes from Vidur rather than FSTS for one reason: **FSTS cannot preempt.** When
+the pool fills, Vidur picks a victim — newest arrival first, so requests closest to finishing keep
+their cache — throws away its KV, and re-prefills everything it had generated. Real GPU work, real
+watts, no new output, and *nothing in the arrival pattern predicts it*.
+
+GPT-2 never hits this on an A100: its cache costs 36 KiB/token, so the pool holds about a million
+tokens. Set `SchedulerConfig(num_blocks=...)` explicitly to shrink it and study the behaviour a
+70B model would reach naturally.
+
+### Three kinds of time
+
+`KERNEL`, `GAP` (one per iteration, at idle) and `IDLE` (waiting for an arrival). The third only
+exists once there is a real arrival process, and it is why `avg_power_w_wallclock` and
+`avg_power_w_busy` are reported separately — at low load a report that quietly averages only the
+busy segments overstates facility draw substantially.
 
 ---
 
@@ -292,10 +365,16 @@ Three graphs, because they answer different questions:
 
 ## Running it
 
-**Colab (recommended, CPU is fine):** open
-[`notebooks/Dynamic_Shape_Power_Sim_Colab.ipynb`](notebooks/Dynamic_Shape_Power_Sim_Colab.ipynb).
-It clones this repo and the EnergAIzer framework from GitHub, optionally downloads the LUT, runs
-the tests, and draws the graphs. Nothing runs locally.
+**Colab (recommended, CPU is fine).** Two notebooks, both clone this repo from GitHub and run the
+test suite before anything else:
+
+| notebook | what it shows |
+|---|---|
+| [`Serving_Engine_Power_Sim_Colab.ipynb`](notebooks/Serving_Engine_Power_Sim_Colab.ipynb) | L0 + L1 + mixed batching — arrivals, lengths, the scheduler, preemption, fused vs concatenated |
+| [`Dynamic_Shape_Power_Sim_Colab.ipynb`](notebooks/Dynamic_Shape_Power_Sim_Colab.ipynb) | the shape rewriter on its own — any `(batch, seq_len, mode)`, no engine |
+
+A third, [`Trace_GPT2_Decode_Colab.ipynb`](notebooks/Trace_GPT2_Decode_Colab.ipynb), regenerates
+the measured decode templates from scratch.
 
 **Locally:**
 
@@ -314,14 +393,26 @@ python run_demo.py --pkg-path /path/to/energaizer-ispass26-artifact-main \
 
 ```
 dynshape/
-  template.py    learn_scaling, rewrite_dims, the query/key split   ← the core
-  workload.py    random (batch, seq_len, mode) stream + grid sweep
-  predictor.py   GeeBackend | AnalyticBackend + the cache
-  simulate.py    timeline assembly → per-kernel and per-pass records
-  plot.py        the three graphs
-templates/gpt2/  the 25 shipped GPT-2 traces (3 anchors + 22 test targets)
-tests/           107 tests
-run_demo.py      CLI
+  template.py     learn_scaling, rewrite_dims, the query/key split   ← the core
+  workload.py     random (batch, seq_len, mode) stream + grid sweep
+  predictor.py    GeeBackend | AnalyticBackend + the cache
+  simulate.py     timeline assembly → per-kernel and per-pass records
+  plot.py         the three shape-stream graphs
+
+  arrival.py      L0 — static | poisson | gamma | trace, + synthetic λ(t)
+  lengths.py      L0 — fixed | uniform | zipf | trace
+  traffic.py      L0 — the two composed, isolated RNGs per stream
+  entities.py     SimRequest, Batch, Piece — the request lifecycle
+  kvcache.py      L1 — MemoryPlanner + block allocator + watermark
+  scheduler.py    L1 — decode-first chunked prefill, preemption/restart
+  mixed.py        L2 — a mixed batch → kernels; what fuses and what cannot
+  engine.py       the run loop; KERNEL / GAP / IDLE
+  engine_plot.py  the six-panel engine dashboard
+
+templates/gpt2/   25 shipped prefill traces + 3 measured decode anchors
+tests/holdout/    a 4th real decode trace, deliberately unreachable as an anchor
+notebooks/        the shape demo, the decode tracer, the serving-engine notebook
+run_demo.py       CLI
 ```
 
 ## Credit
