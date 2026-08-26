@@ -108,6 +108,36 @@ prefill templates exactly** — every field of every one of the 242 entries, acr
 | `test_predictor.py` | `energy == power × time`; cache correctness and payoff; roofline direction |
 | `test_simulate.py` | contiguous monotone timeline; energy conserved at all three levels; gaps at idle not zero; prefill hotter than decode; every figure renders |
 
+### Decode can be measured instead of inferred — drop three files in
+
+`ShapeRewriter` holds **two laws**, not one. Prefill always has its own, learned from three prefill
+anchors. Decode gets a *second, independent* law as soon as three decode anchors exist — and when
+they do, the inferred query/key split is never consulted:
+
+```
+prefill anchors (3)  ->  prefill law  ->  any prefill shape    verified 25/25
+decode  anchors (3)  ->  decode  law  ->  any decode shape     verifiable the same way
+```
+
+Produce them with the artifact's own harness — three runs, minutes on any A100:
+
+```bash
+python run_model.py --model_type LanguageModel --model GPT2Model --precision bf16     --batch 8  --seqlen 128 --mode decode --trace --trace_save_to dec_b8_s128.csv
+python run_model.py ... --batch 16 --seqlen 128 --mode decode ...   # -> batch exponent
+python run_model.py ... --batch 8  --seqlen 512 --mode decode ...   # -> context exponent
+python parse_trace.py --trace_path ... --parsed_save_to templates/gpt2/
+```
+
+`from_dir` picks up any `..._modedecode.json` automatically. Check which law is in play:
+
+```python
+rw.decode_source        # 'inferred' today; 'measured' once the traces exist
+```
+
+If the real decode trace turns out to have a different number of kernels, that is **printed, not
+swallowed** — a differing kernel list is precisely the thing worth discovering, since it would mean
+the inferred split was wrong about more than exponents.
+
 ### What is **not** validated
 
 **Decode has no ground truth anywhere.** All 90 workload files shipped with the EnergAIzer

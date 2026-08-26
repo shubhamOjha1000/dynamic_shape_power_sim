@@ -130,3 +130,108 @@ def test_decode_context_one_is_the_degenerate_case(rewriter):
         for k, v in q.items():
             if isinstance(v, int) and not isinstance(v, bool):
                 assert v >= 1, f"{op} {k} collapsed to {v}"
+
+
+# --- the second law: real decode traces, when they exist -------------------
+
+import json
+import os
+
+from dynshape import ShapeRewriter
+from conftest import TEMPLATE_DIR, template_path
+
+
+def _write(path, entries):
+    with open(path, "w") as f:
+        json.dump([[q, list(op)] for q, op in entries], f)
+
+
+def _fake_decode_templates(tmp_path, n_entries=2, batch_scale=1, ctx_scale=1):
+    """Hand-made decode anchors so the *plumbing* can be tested without
+    pretending to own real decode measurements.
+
+    Two entries whose fields scale as (batch^1, ctx^0) and (batch^1, ctx^1).
+    """
+    def make(b, s):
+        return [({"batch": 12 * b, "dimM": 1, "dimN": s, "dimK": 64,
+                  "precM": "bf16", "precA": "bf16", "useTensorCore": True},
+                 ("gemm", "tc", "bf16_bf16")),
+                ({"batch": 12 * b, "dim": s, "prec": "bf16"},
+                 ("softmax", "bf16"))][:n_entries]
+
+    for b, s in ((8, 128), (16, 128), (8, 512)):
+        _write(os.path.join(tmp_path, f"gpt2model_gpt2_pbf16_b{b}_s{s}_modedecode.json"),
+               make(b, s))
+    return [os.path.join(tmp_path, f"gpt2model_gpt2_pbf16_b{b}_s{s}_modedecode.json")
+            for b, s in ((8, 128), (16, 128), (8, 512))]
+
+
+def test_without_decode_traces_the_split_is_inferred(rewriter):
+    assert rewriter.decode_source == "inferred"
+    assert rewriter.decode_base is None
+    assert rewriter.n_kernels("decode") == rewriter.n_kernels("prefill")
+
+
+def test_decode_traces_take_over_when_present(tmp_path):
+    paths = _fake_decode_templates(str(tmp_path))
+    rw = ShapeRewriter.from_files(
+        template_path(8, 128), template_path(16, 128), template_path(8, 512),
+        decode_paths=paths)
+
+    assert rw.decode_source == "measured"
+    assert rw.n_kernels("prefill") == 242
+    assert rw.n_kernels("decode") == 2, "decode uses its OWN template, not prefill's"
+
+    # Prefill is untouched by the presence of a decode law.
+    assert rw.expand(32, 512, "prefill") == rewriter_prefill(rw, 32, 512)
+
+    # Decode now comes from the decode law: scaled from its own (b8, s128).
+    dec = rw.expand(16, 512, "decode")
+    assert dec[0][0]["batch"] == 12 * 16
+    assert dec[0][0]["dimN"] == 512
+    assert dec[0][0]["dimM"] == 1
+
+
+def rewriter_prefill(rw, b, s):
+    from dynshape import rewrite_dims
+    return rewrite_dims(rw.base, rw.rules, rw.b0, rw.s0, b, s)
+
+
+def test_from_dir_picks_up_decode_templates_automatically(tmp_path):
+    import shutil
+    for b, s in ((8, 128), (16, 128), (8, 512)):
+        shutil.copy(template_path(b, s), str(tmp_path))
+    assert ShapeRewriter.from_dir(str(tmp_path)).decode_source == "inferred"
+
+    _fake_decode_templates(str(tmp_path))
+    assert ShapeRewriter.from_dir(str(tmp_path)).decode_source == "measured"
+
+
+def test_a_differing_kernel_count_is_reported_not_swallowed(tmp_path, capsys):
+    """If real decode traces to a different number of kernels, the inferred
+    rule was wrong -- and that must be visible, not silently absorbed."""
+    paths = _fake_decode_templates(str(tmp_path), n_entries=1)
+    ShapeRewriter.from_files(template_path(8, 128), template_path(16, 128),
+                             template_path(8, 512), decode_paths=paths)
+    out = capsys.readouterr().out
+    assert "kernel list DOES differ" in out
+    assert "1 kernels" in out and "242" in out
+
+
+def test_decode_paths_are_validated(tmp_path):
+    paths = _fake_decode_templates(str(tmp_path))
+    with pytest.raises(ValueError, match="exactly three"):
+        ShapeRewriter.from_files(template_path(8, 128), template_path(16, 128),
+                                 template_path(8, 512), decode_paths=paths[:2])
+    with pytest.raises(ValueError, match="must be decode traces"):
+        ShapeRewriter.from_files(
+            template_path(8, 128), template_path(16, 128), template_path(8, 512),
+            decode_paths=[template_path(8, 128), template_path(16, 128),
+                          template_path(8, 512)])
+
+
+def test_anchor_modes_must_agree(tmp_path):
+    paths = _fake_decode_templates(str(tmp_path))
+    with pytest.raises(ValueError, match="same mode"):
+        ShapeRewriter._learn_from_anchors(template_path(8, 128), paths[1],
+                                          template_path(8, 512))

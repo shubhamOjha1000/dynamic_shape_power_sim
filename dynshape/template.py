@@ -60,7 +60,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # A traced entry is [query_dict, op_type_list]; we keep op_type as a tuple.
 Entry = Tuple[Dict, Tuple[str, ...]]
@@ -278,6 +278,25 @@ class ShapeRewriter:
     >>> kernels = rw.expand(batch=13, seqlen=377, mode="prefill")   # never traced
     >>> len(kernels)
     242
+
+    **Two laws, not one.** Prefill always has its own law, learned from three
+    prefill anchors and verified exactly against all 25 shipped templates.
+    Decode can have a second, independent law learned from three *decode*
+    anchors -- and when it does, the inferred query/key split of
+    `split_seq_exponent` is never used:
+
+        prefill anchors (3) -> prefill law -> any prefill shape   verified
+        decode  anchors (3) -> decode  law -> any decode shape    verifiable
+
+    Drop `..._modedecode.json` files into the template directory and `from_dir`
+    picks them up automatically. Until then decode falls back to the inferred
+    split, and `decode_source` returns 'inferred' so a caller can say so.
+
+    Producing the three decode anchors is three runs of the artifact's own
+    harness -- `run_model.py --mode decode --trace` at (b8,s128), (b16,s128),
+    (b8,s512) -- then `parse_trace.py`. That single step answers the kernel-list
+    question, deletes the inferred rule, and makes decode testable the same way
+    prefill is.
     """
 
     base: List[Entry]
@@ -286,21 +305,32 @@ class ShapeRewriter:
     s0: int
     model: str = "gpt2"
 
+    #: An optional SECOND law, learned from real decode traces. When present it
+    #: is used verbatim for `mode='decode'` and the inferred query/key split is
+    #: never consulted. See `decode_source`.
+    decode_base: Optional[List[Entry]] = None
+    decode_rules: Optional[Rules] = None
+    decode_b0: Optional[int] = None
+    decode_s0: Optional[int] = None
+
     # -- construction --------------------------------------------------------
 
-    @classmethod
-    def from_files(cls, base_path: str, alt_batch_path: str, alt_seq_path: str,
-                   model: str = "gpt2") -> "ShapeRewriter":
+    @staticmethod
+    def _learn_from_anchors(base_path: str, alt_batch_path: str, alt_seq_path: str):
+        """(base, rules, b0, s0) from three traces that move one input each."""
         b0, s0, mode0 = parse_shape_from_name(base_path)
-        b1, s1, _ = parse_shape_from_name(alt_batch_path)
-        b2, s2, _ = parse_shape_from_name(alt_seq_path)
+        b1, s1, mode1 = parse_shape_from_name(alt_batch_path)
+        b2, s2, mode2 = parse_shape_from_name(alt_seq_path)
 
         if s1 != s0:
             raise ValueError("alt_batch trace must hold seqlen fixed")
         if b2 != b0:
             raise ValueError("alt_seq trace must hold batch fixed")
-        if mode0 != "prefill":
-            raise ValueError("the base template must be a prefill trace")
+        if not (mode0 == mode1 == mode2):
+            raise ValueError(
+                f"all three anchors must be the same mode, got "
+                f"{mode0!r}, {mode1!r}, {mode2!r}"
+            )
 
         base = load_template(base_path)
         rules = learn_scaling(
@@ -310,7 +340,39 @@ class ShapeRewriter:
             batch_ratio=b1 / b0,
             seq_ratio=s2 / s0,
         )
-        return cls(base=base, rules=rules, b0=b0, s0=s0, model=model)
+        return base, rules, b0, s0, mode0
+
+    @classmethod
+    def from_files(cls, base_path: str, alt_batch_path: str, alt_seq_path: str,
+                   model: str = "gpt2",
+                   decode_paths: Optional[Sequence[str]] = None) -> "ShapeRewriter":
+        """Learn the prefill law, and optionally a real decode law beside it.
+
+        `decode_paths` is the same three-anchor pattern traced with
+        `--mode decode`: (base, alt_batch, alt_seq). Supply it and decode stops
+        being inferred -- see the class docstring.
+        """
+        base, rules, b0, s0, mode0 = cls._learn_from_anchors(
+            base_path, alt_batch_path, alt_seq_path)
+        if mode0 != "prefill":
+            raise ValueError("the base template must be a prefill trace")
+
+        d_base = d_rules = d_b0 = d_s0 = None
+        if decode_paths is not None:
+            if len(decode_paths) != 3:
+                raise ValueError("decode_paths needs exactly three anchor traces")
+            d_base, d_rules, d_b0, d_s0, d_mode = cls._learn_from_anchors(*decode_paths)
+            if d_mode != "decode":
+                raise ValueError(f"decode_paths must be decode traces, got {d_mode!r}")
+            if len(d_base) != len(base):
+                # NOT an error -- this is exactly the thing worth discovering.
+                print(f"[dynshape] note: decode traces to {len(d_base)} kernels, "
+                      f"prefill to {len(base)}. The kernel list DOES differ between "
+                      f"modes; the inferred split rule would have been wrong.")
+
+        return cls(base=base, rules=rules, b0=b0, s0=s0, model=model,
+                   decode_base=d_base, decode_rules=d_rules,
+                   decode_b0=d_b0, decode_s0=d_s0)
 
     @classmethod
     def from_dir(cls, template_dir: str, model: str = "gpt2",
@@ -322,26 +384,37 @@ class ShapeRewriter:
         become validation targets for `tests/test_scaling.py`.
         """
         files = [f for f in sorted(os.listdir(template_dir)) if f.endswith(".json")]
-        by_shape = {}
+        by_mode: Dict[str, Dict] = {"prefill": {}, "decode": {}}
         for f in files:
             try:
                 b, s, mode = parse_shape_from_name(f)
             except ValueError:
                 continue
-            if mode == "prefill":
-                by_shape[(b, s)] = os.path.join(template_dir, f)
+            if mode in by_mode:
+                by_mode[mode][(b, s)] = os.path.join(template_dir, f)
 
-        if (b0, s0) not in by_shape:
-            raise FileNotFoundError(f"no prefill template at b={b0}, s={s0} in {template_dir}")
+        def anchors(by_shape, mode):
+            """The three files that move one input each, or None."""
+            if (b0, s0) not in by_shape:
+                return None
+            alt_b = next((by_shape[(b, s0)] for b, s in sorted(by_shape)
+                          if s == s0 and b != b0), None)
+            alt_s = next((by_shape[(b0, s)] for b, s in sorted(by_shape)
+                          if b == b0 and s != s0), None)
+            if alt_b is None or alt_s is None:
+                return None
+            return (by_shape[(b0, s0)], alt_b, alt_s)
 
-        alt_b = next((by_shape[(b, s0)] for b, s in sorted(by_shape) if s == s0 and b != b0), None)
-        alt_s = next((by_shape[(b0, s)] for b, s in sorted(by_shape) if b == b0 and s != s0), None)
-        if alt_b is None or alt_s is None:
+        pre = anchors(by_mode["prefill"], "prefill")
+        if pre is None:
             raise FileNotFoundError(
-                "need one template at a different batch and one at a different seqlen; "
-                f"found shapes {sorted(by_shape)}"
+                f"need prefill templates at b={b0} s={s0}, one at another batch and "
+                f"one at another seqlen; found {sorted(by_mode['prefill'])} in {template_dir}"
             )
-        return cls.from_files(by_shape[(b0, s0)], alt_b, alt_s, model=model)
+        # Decode anchors are optional. When they are absent the inferred
+        # query/key split is used instead, and `decode_source` says so.
+        dec = anchors(by_mode["decode"], "decode")
+        return cls.from_files(*pre, model=model, decode_paths=dec)
 
     # -- use -----------------------------------------------------------------
 
@@ -358,11 +431,28 @@ class ShapeRewriter:
             return rewrite_dims_qk(self.base, self.rules, self.b0, self.s0,
                                    batch, seq_q=seqlen, seq_k=seqlen)
         if mode == "decode":
+            if self.decode_base is not None:
+                # Measured decode law: decode has its own template and its own
+                # exponents, so the query/key split is never consulted.
+                return rewrite_dims(self.decode_base, self.decode_rules,
+                                    self.decode_b0, self.decode_s0, batch, seqlen)
             return rewrite_dims_qk(self.base, self.rules, self.b0, self.s0,
                                    batch, seq_q=1, seq_k=seqlen)
         raise ValueError(f"mode must be 'prefill' or 'decode', got {mode!r}")
 
-    def n_kernels(self) -> int:
+    @property
+    def decode_source(self) -> str:
+        """Where decode shapes come from -- always report this beside a number.
+
+        'measured'  : learned from real decode traces, validatable like prefill.
+        'inferred'  : derived from the prefill law by `split_seq_exponent`.
+                      Structurally consistent, never checked against hardware.
+        """
+        return "measured" if self.decode_base is not None else "inferred"
+
+    def n_kernels(self, mode: str = "prefill") -> int:
+        if mode == "decode" and self.decode_base is not None:
+            return len(self.decode_base)
         return len(self.base)
 
     def field_report(self) -> List[Tuple[Tuple[str, ...], str, int, int, int, int]]:
