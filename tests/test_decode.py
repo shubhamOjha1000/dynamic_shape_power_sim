@@ -11,7 +11,7 @@ sequence, plus a length-`seqlen` KV cache).
 
 import pytest
 
-from dynshape import rewrite_dims, split_seq_exponent
+from dynshape import load_template, rewrite_dims, split_seq_exponent
 
 HEADS = 12          # GPT-2 base
 HIDDEN = 768
@@ -175,10 +175,57 @@ def _fake_decode_templates(tmp_path, n_entries=2, batch_scale=1, ctx_scale=1):
             for b, s in ((8, 128), (16, 128), (8, 512))]
 
 
-def test_without_decode_traces_the_split_is_inferred(rewriter):
-    assert rewriter.decode_source == "inferred"
-    assert rewriter.decode_base is None
-    assert rewriter.n_kernels("decode") == rewriter.n_kernels("prefill")
+def test_shipped_decode_traces_are_measured(rewriter):
+    """The repo now ships real decode anchors, so decode is no longer inferred."""
+    assert rewriter.decode_source == "measured"
+    assert rewriter.decode_base is not None
+    assert rewriter.n_kernels("decode") == rewriter.n_kernels("prefill") == 242
+    assert rewriter.decode_seq_offset == 1, "the +1 key must be detected from the traces"
+
+
+def test_falls_back_to_inferred_without_decode_traces(tmp_path):
+    """Remove the decode anchors and the inferred split takes over again."""
+    import shutil
+    for b, s in [(8, 128), (16, 128), (8, 512)]:
+        shutil.copy(template_path(b, s), str(tmp_path))
+    rw = ShapeRewriter.from_dir(str(tmp_path))
+    assert rw.decode_source == "inferred"
+    assert rw.decode_base is None
+    # and it must still agree with the measurement it was corrected against
+    assert rw.expand(8, 128, "decode") == rewriter_measured_expand()
+
+
+def rewriter_measured_expand():
+    from conftest import TEMPLATE_DIR
+    return ShapeRewriter.from_dir(TEMPLATE_DIR).expand(8, 128, "decode")
+
+
+def test_measured_decode_law_reproduces_the_holdout():
+    """The independent check: predict a real trace never used to learn the law.
+
+    The three anchors in templates/gpt2/ fit the law; tests/holdout/ holds a
+    fourth real trace that `from_dir` cannot see. If this passes, decode
+    generalises rather than being memorised.
+    """
+    from conftest import HOLDOUT_DIR, TEMPLATE_DIR
+
+    rw = ShapeRewriter.from_dir(TEMPLATE_DIR)
+    assert rw.decode_source == "measured"
+
+    path = os.path.join(HOLDOUT_DIR,
+                        "gpt2model_gpt2_pbf16_b16_s512_modedecode.json")
+    held = load_template(path)
+    assert rw.expand(16, 512, "decode") == held, "held-out decode trace not reproduced"
+
+
+def test_holdout_is_not_reachable_as_an_anchor():
+    """Guard the independence property itself."""
+    from conftest import HOLDOUT_DIR, TEMPLATE_DIR
+
+    assert os.path.abspath(HOLDOUT_DIR) != os.path.abspath(TEMPLATE_DIR)
+    assert not [f for f in os.listdir(TEMPLATE_DIR) if "b16_s512_modedecode" in f], (
+        "the held-out trace has been copied into templates/ -- the independent "
+        "decode check is now a memorisation test")
 
 
 def test_decode_traces_take_over_when_present(tmp_path):

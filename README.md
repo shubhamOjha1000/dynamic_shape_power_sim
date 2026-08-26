@@ -118,7 +118,7 @@ prefill templates exactly** — every field of every one of the 242 entries, acr
 | Test file | What it pins down |
 |---|---|
 | `test_scaling.py` | the 25-file exact-match grid; every failure mode raises; two different anchor pairs learn identical rules |
-| `test_decode.py` | the query/key split **reduces to prefill exactly** when `Sq == Sk`, which ties the unvalidated decode path to the validated prefill one; decode attention is a strip; softmax and mask shapes agree with what attention produced |
+| `test_decode.py` | decode's key axis is `context + 1`, measured; the shipped anchors give `decode_source == "measured"` with offset 1; the law reproduces a **held-out real trace** exactly; the query/key split still reduces to prefill when `Sq == Sk` |
 | `test_workload.py` | reproducibility, isolated substreams, ranges, bucketing |
 | `test_predictor.py` | `energy == power × time`; cache correctness and payoff; roofline direction |
 | `test_simulate.py` | contiguous monotone timeline; energy conserved at all three levels; gaps at idle not zero; prefill hotter than decode; every figure renders |
@@ -174,8 +174,15 @@ Tracing it (see the notebook below) settled three things that were previously as
 | was the inferred query/key split right? | **no** — off by one token on 48 of 242 entries, now corrected |
 | does a decode law learned from 3 anchors generalise? | **yes** — reproduces a held-out 4th trace exactly |
 
-Until those traces are committed to `templates/gpt2/`, `decode_source` reports `inferred`: the
-shapes are correct but derived from the prefill law rather than read from decode measurements.
+**Those traces are now committed.** `templates/gpt2/` holds three real decode anchors
+(`b8 s128`, `b16 s128`, `b8 s512`), so `decode_source` reports `measured` out of the box and
+`split_seq_exponent` is never consulted for GPT-2.
+
+A fourth real trace, `b16 s512`, is kept in [`tests/holdout/`](tests/holdout/) — deliberately
+outside `templates/gpt2/`, where `from_dir` cannot reach it. It is never used to learn a law, only
+to check one: `test_measured_decode_law_reproduces_the_holdout` fits on the three anchors and
+predicts it exactly. A second test guards that separation, so the independent check cannot quietly
+become a memorisation test.
 
 Also assumed, and stated rather than tested: kernel costs are **additive** within a pass (no
 overlap, no memory contention, no cache carry-over); the template is traced from **HuggingFace**,

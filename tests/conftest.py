@@ -9,6 +9,10 @@ if ROOT not in sys.path:
 
 TEMPLATE_DIR = os.path.join(ROOT, "templates", "gpt2")
 
+#: A real decode trace kept OUT of TEMPLATE_DIR so it can never become an anchor.
+#: See tests/holdout/README.md.
+HOLDOUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "holdout")
+
 B0, S0 = 8, 128
 #: Every (batch, seqlen) prefill template that ships with the EnergAIzer artifact.
 SHIPPED_BATCHES = [1, 2, 8, 16, 32]
