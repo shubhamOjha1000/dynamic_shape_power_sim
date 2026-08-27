@@ -63,6 +63,10 @@ from .mixed import (attention_mask, build_iteration_kernels,
                     build_iteration_kernels_tagged, fusible_mask,
                     iteration_token_shapes, mixed_report)
 from .work import WORK_FIELDS, gemm_work, kernel_work
+from .energaizer import (ArtifactPaths, build_estimator, build_gee_predictor,
+                         flatten_lut, idle_power_table, measured_idle_power_w,
+                         clone_artifact, download_lut, locate_artifact,
+                         lut_status)
 from .engine import EngineConfig, EngineTrace, IterationRecord, Segment, run_engine
 
 __version__ = "0.2.0"
@@ -90,6 +94,10 @@ __all__ = [
     "fusible_mask", "attention_mask", "mixed_report", "iteration_token_shapes",
     # work accounting, independent of any power model
     "kernel_work", "gemm_work", "WORK_FIELDS",
+    # the measured model
+    "build_gee_predictor", "clone_artifact", "download_lut", "locate_artifact",
+    "lut_status", "build_estimator", "ArtifactPaths",
+    "flatten_lut", "measured_idle_power_w", "idle_power_table",
     # the loop
     "EngineConfig", "EngineTrace", "IterationRecord", "Segment", "run_engine",
 ]

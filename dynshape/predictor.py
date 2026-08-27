@@ -70,21 +70,83 @@ class Backend:
     def predict(self, q: Dict, op: Tuple[str, ...], freq: int) -> Tuple[float, float, float]:
         raise NotImplementedError
 
+    def stats(self) -> Dict:
+        """Anything the backend wants reported beside the numbers."""
+        return {}
+
+
+def _scalar(x) -> float:
+    """Unwrap whatever `lookup` hands back into a plain float.
+
+    Necessary, not defensive: EnergAIzer's own `lookup` converts *energy* and
+    *time* from a pandas Series but leaves *power* alone, so the third value can
+    arrive as a one-element Series, a numpy scalar or a float depending on which
+    estimator branch ran.
+    """
+    if hasattr(x, "values"):
+        x = x.values
+    if hasattr(x, "item") and getattr(x, "size", 1) == 1:
+        return float(x.item())
+    if isinstance(x, (list, tuple)):
+        return float(x[0])
+    return float(x)
+
 
 class GeeBackend(Backend):
-    """The real EnergAIzer estimator."""
+    """The real EnergAIzer estimator -- measured lookup tables, not a roofline.
 
-    name = "energaizer"
+    `lookup(..., lookup_target='all')` returns `(time_ms, power_W, energy_J)`.
+    Those three come from related but distinct prediction paths, so they need not
+    satisfy `energy == power x time` exactly, and downstream code assumes they
+    do: an iteration's average power is its summed energy over its summed time.
+
+    `reconcile` decides what to do about that, explicitly:
+
+        'report'  return all three as measured, and record the largest
+                  disagreement seen so it can be inspected.  The default,
+                  because silently rewriting a measured number is worse than
+                  carrying a small inconsistency you can see.
+        'energy'  trust energy, derive power = E/t.  Makes per-kernel power
+                  agree with every aggregate that is computed from energy.
+        'power'   trust power, derive energy = P*t.
+    """
+
+    name = "energaizer (measured LUT)"
     is_measured_model = True
 
-    def __init__(self, estimator):
+    def __init__(self, estimator, reconcile: str = "report"):
+        if reconcile not in ("report", "energy", "power"):
+            raise ValueError("reconcile must be 'report', 'energy' or 'power'")
         self.estimator = estimator
+        self.reconcile = reconcile
+        self.max_inconsistency = 0.0
+        self.n_predictions = 0
 
     def predict(self, q: Dict, op: Tuple[str, ...], freq: int) -> Tuple[float, float, float]:
         t, p, e = self.estimator.lookup(
             dict(q), tuple(op), target_freq=freq, lookup_target="all"
         )
-        return float(t), float(p), float(e)
+        t_ms, power_w, energy_j = _scalar(t), _scalar(p), _scalar(e)
+
+        implied = power_w * t_ms / 1000.0
+        if energy_j > 0:
+            self.max_inconsistency = max(
+                self.max_inconsistency, abs(implied - energy_j) / energy_j)
+        self.n_predictions += 1
+
+        if self.reconcile == "energy":
+            power_w = energy_j / (t_ms / 1000.0) if t_ms > 0 else power_w
+        elif self.reconcile == "power":
+            energy_j = implied
+
+        return t_ms, power_w, energy_j
+
+    def stats(self) -> Dict:
+        return {
+            "reconcile": self.reconcile,
+            "max_energy_vs_power_x_time": self.max_inconsistency,
+            "lut_lookups": self.n_predictions,
+        }
 
 
 class AnalyticBackend(Backend):
@@ -192,10 +254,12 @@ class CachedPredictor:
         return {
             "backend": self.backend.name,
             "is_measured_model": self.backend.is_measured_model,
+            "freq_mhz": self.freq,
             "distinct_shapes": len(self.cache),
             "hits": self.hits,
             "misses": self.misses,
             "hit_rate": self.hit_rate,
+            **self.backend.stats(),
         }
 
 
@@ -205,22 +269,42 @@ class CachedPredictor:
 
 def build_predictor(pkg_path: Optional[str] = None, lut_dir: Optional[str] = None,
                     gpu_yaml: Optional[str] = None, lut_yaml: Optional[str] = None,
-                    freq: int = 900, force_analytic: bool = False) -> CachedPredictor:
+                    freq: int = 900, force_analytic: bool = False,
+                    require_measured: bool = False,
+                    reconcile: str = "report") -> CachedPredictor:
     """Real EnergAIzer if the LUT is present, otherwise the analytic fallback.
 
-    Never raises for a missing LUT -- it degrades, loudly, so a Colab cell that
-    skipped the 500 MB download still produces a graph.
+    By default this **degrades rather than raises**, so a Colab cell that skipped
+    the multi-hundred-MB download still produces a graph -- but it says so, and
+    every figure carries the backend name.
+
+    Pass `require_measured=True` when the whole point of the run is the measured
+    model.  Silent fallback is right for a demo and wrong there: you want to know
+    you did not get EnergAIzer, not to read SYNTHETIC numbers under a heading
+    that says measured.  `dynshape.energaizer.build_gee_predictor` is the same
+    thing with better diagnostics.
     """
-    if force_analytic or not (pkg_path and lut_dir):
+    def fallback(why: str) -> CachedPredictor:
+        if require_measured:
+            raise RuntimeError(
+                f"require_measured=True but the measured model is unavailable: {why}")
+        print(f"[predictor] {why} -> falling back to the SYNTHETIC analytic model")
         return CachedPredictor(backend=AnalyticBackend(), freq=freq)
+
+    if force_analytic:
+        if require_measured:
+            raise ValueError("force_analytic and require_measured are contradictory")
+        return CachedPredictor(backend=AnalyticBackend(), freq=freq)
+
+    if not (pkg_path and lut_dir):
+        return fallback("no artifact path or LUT directory given")
 
     import glob
     import os
     import sys
 
     if not glob.glob(os.path.join(lut_dir, "*.csv")):
-        print(f"[predictor] no LUT csv in {lut_dir} -> falling back to SYNTHETIC analytic model")
-        return CachedPredictor(backend=AnalyticBackend(), freq=freq)
+        return fallback(f"no LUT csv in {lut_dir}")
 
     if pkg_path not in sys.path:
         sys.path.insert(0, pkg_path)
@@ -234,7 +318,7 @@ def build_predictor(pkg_path: Optional[str] = None, lut_dir: Optional[str] = Non
             lut_folder_abs_path=lut_dir,
         )
     except Exception as e:                                   # pragma: no cover
-        print(f"[predictor] could not build EnergAIzer ({e!r}) -> SYNTHETIC analytic model")
-        return CachedPredictor(backend=AnalyticBackend(), freq=freq)
+        return fallback(f"could not build EnergAIzer ({e!r})")
 
-    return CachedPredictor(backend=GeeBackend(estimator), freq=freq)
+    return CachedPredictor(backend=GeeBackend(estimator, reconcile=reconcile),
+                           freq=freq)
