@@ -337,6 +337,34 @@ GPT-2 never hits this on an A100: its cache costs 36 KiB/token, so the pool hold
 tokens. Set `SchedulerConfig(num_blocks=...)` explicitly to shrink it and study the behaviour a
 70B model would reach naturally.
 
+### Reporting power the way a meter would
+
+Per-iteration events are the natural output of a kernel simulator and the wrong thing to hand
+anyone: the steps have variable width, so the series cannot be lined up against an NVML capture,
+averaged across runs, or used to quote a peak.
+
+```python
+t_ms, watts = trace.resample(dt_ms=1.0)                      # fixed grid, energy-conserving
+t_ms, watts = trace.resample(dt_ms=1.0, smooth_tau_ms=5.0)   # through a board response
+```
+
+`resample()` is a box filter — the integral of the returned series equals `total_energy_j` at any
+sample rate — and `smooth_tau_ms` applies a one-pole board response, because a real sensor never
+sees the square edges a kernel trace produces. **A peak is not a number until you say over what
+window**: the same trace peaks differently at a 0.1 ms aperture than at 100 ms, while the mean and
+the integral are invariant.
+
+Each iteration also carries a **work vector** — FLOPs and bytes implied by the shapes, computed in
+[`work.py`](dynshape/work.py) with no power model involved. It is what separates the two error
+sources: if a predicted trace disagrees with a measured one, the work vector says whether the
+simulator got the *work* wrong or the *conversion to watts* wrong. With only watts, those are
+indistinguishable — and with a SYNTHETIC predictor in the loop, that distinction is the whole game.
+
+FLOPs split between prefill and decode **exactly** (a fused GEMM's rows each belong to one request,
+and FLOPs are linear in the row count). Bytes do not — the weight matrix is read once for the whole
+batch, which is the entire point of fusing it — so the split is applied to the first and refused for
+the second.
+
 ### Three kinds of time
 
 `KERNEL`, `GAP` (one per iteration, at idle) and `IDLE` (waiting for an arrival). The third only
@@ -398,6 +426,7 @@ dynshape/
   predictor.py    GeeBackend | AnalyticBackend + the cache
   simulate.py     timeline assembly → per-kernel and per-pass records
   plot.py         the three shape-stream graphs
+  work.py         FLOPs and bytes from a shape -- no backend, no LUT
 
   arrival.py      L0 — static | poisson | gamma | trace, + synthetic λ(t)
   lengths.py      L0 — fixed | uniform | zipf | trace

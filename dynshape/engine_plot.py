@@ -315,3 +315,102 @@ def plot_engine_dashboard(trace: EngineTrace, max_ms: Optional[float] = None,
         fontsize=12, y=0.995)
     _stamp(fig, trace)
     return fig
+
+
+def plot_resampled_power(trace: EngineTrace, dt_ms: float = 1.0,
+                         smooth_tau_ms: Optional[float] = 5.0,
+                         ax=None, max_ms: Optional[float] = None,
+                         show_raw: bool = True):
+    """The trace on a fixed time grid -- what a meter would actually record.
+
+    Three things overlaid, deliberately:
+
+      * the event-based staircase (variable-width iterations) in grey
+      * the resampled series at `dt_ms`, energy-conserving
+      * the same series through a one-pole board response at `smooth_tau_ms`
+
+    The gap between the first and the third is the answer to "would a sensor see
+    this?", and it is usually large. Assumption 5 of the design doc says a real
+    sensor never sees the square edges a kernel trace produces; this is that
+    assumption made visible rather than asserted.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(13, 4))
+
+    limit = max_ms if max_ms is not None else trace.total_time_ms
+
+    if show_raw:
+        ts, ps = trace.power_steps()
+        ax.step(ts, ps, where="post", lw=0.6, color="#bbbbbb", zorder=1,
+                label="per-iteration events (variable width)")
+
+    t, p = trace.resample(dt_ms=dt_ms)
+    ax.plot(t, p, lw=0.9, color="#1f4e79", zorder=3,
+            label=f"resampled, dt = {dt_ms:g} ms")
+
+    if smooth_tau_ms:
+        _, ps_s = trace.resample(dt_ms=dt_ms, smooth_tau_ms=smooth_tau_ms)
+        ax.plot(t, ps_s, lw=1.6, color="#c0392b", zorder=4,
+                label=f"through a {smooth_tau_ms:g} ms board response")
+
+    # Energy conservation is the property that makes the resample trustworthy,
+    # so state it on the figure rather than in a docstring nobody reads.
+    integral = float(np.sum(p) * dt_ms / 1000.0)
+    err = abs(integral - trace.total_energy_j) / max(trace.total_energy_j, 1e-12)
+
+    ax.set_xlim(0, limit)
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel("wall clock (ms)")
+    ax.set_ylabel("power (W)")
+    ax.set_title(f"Fixed-rate power -- integral {integral:.1f} J vs "
+                 f"{trace.total_energy_j:.1f} J from the events "
+                 f"({err:.2e} relative error)")
+    ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
+    ax.grid(alpha=0.25)
+    return ax
+
+
+def plot_work_vector(trace: EngineTrace, ax=None, max_ms: Optional[float] = None):
+    """Arithmetic and traffic per iteration, independent of any power model.
+
+    Reported beside the watts because it separates the two error sources: if a
+    predicted trace disagrees with a measured one, this says whether the
+    simulator got the *work* wrong or the *conversion to watts* wrong. With only
+    watts, those are indistinguishable.
+    """
+    import matplotlib.pyplot as plt
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(13, 3.4))
+
+    limit = max_ms if max_ms is not None else trace.total_time_ms
+    its = [i for i in trace.iterations if i.t_start_ms < limit]
+    if not its:
+        return ax
+
+    t = [i.t_start_ms for i in its]
+    lin = [i.linear_flops / 1e9 for i in its]
+    att = [i.attn_flops / 1e9 for i in its]
+    tot = [a + b for a, b in zip(lin, att)]
+
+    ax.fill_between(t, 0, lin, step="post", color="#34495e", alpha=0.85,
+                    label="linear / MLP GFLOP (fused)")
+    ax.fill_between(t, lin, tot, step="post", color="#e67e22", alpha=0.85,
+                    label="attention GFLOP (per request)")
+    ax.set_xlim(0, limit)
+    ax.set_xlabel("wall clock (ms)")
+    ax.set_ylabel("GFLOP in the iteration")
+
+    ax2 = ax.twinx()
+    ax2.plot(t, [i.arithmetic_intensity for i in its], lw=0.8, color="#16a085")
+    ax2.set_ylabel("FLOP / byte", color="#16a085")
+    ax2.tick_params(axis="y", labelcolor="#16a085")
+
+    ax.set_title("Work vector -- the arithmetic behind the watts "
+                 "(green: arithmetic intensity, i.e. which side of the roofline)")
+    ax.legend(loc="upper left", fontsize=8, framealpha=0.9)
+    ax.grid(alpha=0.25)
+    return ax

@@ -32,6 +32,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
+from .work import BYTES_PER_ELEMENT, kernel_work, uses_tensor_core
+
 # ---------------------------------------------------------------------------
 # A100-40GB-PCIe (EnergAIzer's `yz8`).  Used by the analytic backend only.
 # ---------------------------------------------------------------------------
@@ -45,7 +47,9 @@ A100_PCIE = {
     "launch_overhead_ms": 0.002,    # the epsilon in t = lambda*t_ideal + epsilon
 }
 
-_BYTES = {"fp32": 4, "tf32": 4, "bf16": 2, "fp16": 2, "int8": 1, "fp8": 1}
+#: Kept as an alias so anything importing it still works; the table now lives in
+#: `work.py`, beside the FLOP/byte arithmetic that uses it.
+_BYTES = BYTES_PER_ELEMENT
 
 
 def query_type_of(q: Dict, op: Tuple[str, ...]) -> Tuple[str, ...]:
@@ -106,33 +110,21 @@ class AnalyticBackend(Backend):
 
     # -- work / traffic per op ---------------------------------------------
 
-    def _gemm(self, q: Dict) -> Tuple[float, float, float]:
-        b = q.get("batch", 1)
-        m, n, k = q["dimM"], q["dimN"], q["dimK"]
-        w = _BYTES.get(q.get("precM", "bf16"), 2)
-        flops = 2.0 * b * m * n * k
-        byts = float(b) * (m * k + k * n + m * n) * w
-        peak = (self.gpu["peak_tc_bf16_flops"] if q.get("useTensorCore", False)
+    def _work(self, q: Dict, op: Tuple[str, ...]) -> Tuple[float, float, float]:
+        """(flops, bytes, peak_flops).
+
+        FLOPs and bytes come from `work.kernel_work`, which is also what the
+        engine reports as its per-iteration work vector -- so the roofline and
+        the reported arithmetic cannot drift apart.  Only the peak-rate choice
+        is the backend's own business.
+        """
+        try:
+            flops, byts, _weights = kernel_work(q, op)
+        except NotImplementedError:
+            raise NotImplementedError(f"analytic backend has no model for op {op!r}")
+        peak = (self.gpu["peak_tc_bf16_flops"] if uses_tensor_core(q, op)
                 else self.gpu["peak_cuda_fp32_flops"])
         return flops, byts, peak
-
-    def _memory_op(self, elements: float, w: int, passes: float) -> Tuple[float, float, float]:
-        # No meaningful math; the kernel is defined by how many times it must
-        # stream its data.
-        return 0.0, elements * w * passes, self.gpu["peak_cuda_fp32_flops"]
-
-    def _work(self, q: Dict, op: Tuple[str, ...]) -> Tuple[float, float, float]:
-        head = op[0]
-        w = _BYTES.get(q.get("prec", q.get("precM", "bf16")), 2)
-        if head == "gemm":
-            return self._gemm(q)
-        if head == "elementwise":
-            return self._memory_op(q["dim"], w, 3.0)          # read, read, write
-        if head == "layernorm":
-            return self._memory_op(q["batch"] * q["dim"], w, 3.0)   # 2 passes + write
-        if head == "softmax":
-            return self._memory_op(q["batch"] * q["dim"], w, 3.0)   # max, exp/sum, write
-        raise NotImplementedError(f"analytic backend has no model for op {op!r}")
 
     # -- interface ----------------------------------------------------------
 

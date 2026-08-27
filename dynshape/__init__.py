@@ -62,6 +62,7 @@ from .scheduler import ChunkedPrefillScheduler, SchedulerConfig
 from .mixed import (attention_mask, build_iteration_kernels,
                     build_iteration_kernels_tagged, fusible_mask,
                     iteration_token_shapes, mixed_report)
+from .work import WORK_FIELDS, gemm_work, kernel_work
 from .engine import EngineConfig, EngineTrace, IterationRecord, Segment, run_engine
 
 __version__ = "0.2.0"
@@ -87,6 +88,8 @@ __all__ = [
     # L2 for mixed batches
     "build_iteration_kernels", "build_iteration_kernels_tagged",
     "fusible_mask", "attention_mask", "mixed_report", "iteration_token_shapes",
+    # work accounting, independent of any power model
+    "kernel_work", "gemm_work", "WORK_FIELDS",
     # the loop
     "EngineConfig", "EngineTrace", "IterationRecord", "Segment", "run_engine",
 ]

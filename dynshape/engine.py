@@ -50,6 +50,7 @@ from .predictor import CachedPredictor
 from .scheduler import ChunkedPrefillScheduler, SchedulerConfig
 from .simulate import GAP_MS, IDLE_W, _shape_label
 from .template import ShapeRewriter
+from .work import WORK_FIELDS, empty_work, kernel_work
 
 
 @dataclass
@@ -114,9 +115,32 @@ class IterationRecord:
     kv_utilisation: float
     preemptions_total: int
 
+    # -- the work vector -----------------------------------------------------
+    # FLOPs and bytes implied by the shapes, independent of any power model.
+    # Reported alongside the watts so the two error sources stay separable: if a
+    # predicted trace disagrees with a real one, these say whether the *work* is
+    # wrong (scheduler or shapes) or the *conversion to watts* is (predictor).
+    linear_flops: float = 0.0
+    linear_bytes: float = 0.0
+    weight_bytes: float = 0.0
+    attn_flops: float = 0.0
+    attn_bytes: float = 0.0
+    #: FLOPs split by phase.  Exact, not apportioned: a fused GEMM's rows each
+    #: belong to one request and FLOPs are linear in the row count.  Bytes are
+    #: deliberately *not* split -- the weight matrix is read once for the whole
+    #: batch, which is the entire point of fusing it.
+    prefill_flops: float = 0.0
+    decode_flops: float = 0.0
+
     @property
     def t_end_ms(self) -> float:
         return self.t_start_ms + self.duration_ms + self.gap_ms
+
+    @property
+    def arithmetic_intensity(self) -> float:
+        """FLOPs per byte -- which side of the roofline this iteration sits on."""
+        b = self.linear_bytes + self.attn_bytes
+        return (self.linear_flops + self.attn_flops) / b if b else 0.0
 
     @property
     def is_mixed(self) -> bool:
@@ -271,6 +295,79 @@ class EngineTrace:
             ps.append(last[1])
         return ts, ps
 
+    def resample(self, dt_ms: float = 1.0, smooth_tau_ms: Optional[float] = None,
+                 include_idle: bool = True):
+        """The trace on a **fixed time grid** -- `(times_ms, power_W)` arrays.
+
+        This is what a power meter produces, and what the event-based staircase
+        above is not.  Iterations have variable width, so `power_steps()` cannot
+        be compared against an NVML capture, averaged across runs, or fed to
+        anything expecting a uniform series.  Resampling fixes all three.
+
+        **Energy-conserving by construction.** Each iteration's energy is spread
+        across the bins it overlaps in proportion to the overlap, so the integral
+        of the returned series equals `total_energy_j` whatever `dt_ms` is.  A
+        box filter, which is exactly what an integrating meter does over its
+        aperture.
+
+        `smooth_tau_ms` then applies a one-pole RC response.  A real sensor never
+        sees the square edges this trace produces -- board capacitance smooths
+        microsecond transitions -- so comparing a raw simulated trace against a
+        measured one at the same sample rate compares two different things.
+        Typical board time constants are single-digit milliseconds.
+
+        Idle stretches are included by default: leaving them out is what makes a
+        duty-cycled machine look like it draws its busy power all day.
+        """
+        import numpy as np
+
+        if dt_ms <= 0:
+            raise ValueError("dt_ms must be > 0")
+        total = self.total_time_ms
+        if total <= 0:
+            return np.zeros(0), np.zeros(0)
+
+        n = max(1, int(np.ceil(total / dt_ms)))
+        energy = np.zeros(n)
+
+        spans = [(i.t_start_ms, i.t_end_ms, i.energy_j) for i in self.iterations]
+        if include_idle:
+            spans += [(s.t_start_ms, s.t_end_ms, s.energy_j)
+                      for s in self.idle_segments]
+
+        for a, b, e in spans:
+            if b <= a or e == 0.0:
+                continue
+            watts = e / ((b - a) / 1000.0)
+            first = min(n - 1, int(a // dt_ms))
+            last = min(n - 1, int((b - 1e-12) // dt_ms))
+            for k in range(first, last + 1):
+                lo = max(a, k * dt_ms)
+                hi = min(b, (k + 1) * dt_ms)
+                if hi > lo:
+                    energy[k] += watts * (hi - lo) / 1000.0
+
+        # The final bin is usually a partial one; dividing it by a full dt would
+        # understate its power.
+        widths = np.full(n, dt_ms)
+        widths[-1] = total - (n - 1) * dt_ms or dt_ms
+        power = energy / (widths / 1000.0)
+
+        if smooth_tau_ms:
+            alpha = 1.0 - float(np.exp(-dt_ms / smooth_tau_ms))
+            out = np.empty_like(power)
+            acc = float(power[0])
+            for k, x in enumerate(power):
+                acc += (float(x) - acc) * alpha
+                out[k] = acc
+            power = out
+
+        return np.arange(n) * dt_ms, power
+
+    def work_totals(self) -> Dict[str, float]:
+        """The work vector summed over the run -- backend-independent totals."""
+        return {f: sum(getattr(i, f) for i in self.iterations) for f in WORK_FIELDS}
+
     def kernel_power_steps(self) -> Tuple[List[float], List[float]]:
         """Kernel-resolution staircase -- only where kernels were recorded."""
         segs = sorted(self.segments, key=lambda s: s.t_start_ms)
@@ -285,7 +382,8 @@ class EngineTrace:
         """(iterations_df, requests_df, segments_df)."""
         import pandas as pd
         idf = pd.DataFrame([{**i.__dict__, "is_mixed": i.is_mixed,
-                             "tokens_per_s": i.tokens_per_s}
+                             "tokens_per_s": i.tokens_per_s,
+                             "arithmetic_intensity": i.arithmetic_intensity}
                             for i in self.iterations])
         rdf = pd.DataFrame(self.request_metrics())
         sdf = pd.DataFrame([s.__dict__ for s in self.segments])
@@ -398,7 +496,30 @@ def run_engine(
         n_ok = n_skip = 0
         keep = record_kernels_now()
 
+        work = empty_work()
+        prefill_share = (shapes["prefill_tokens"] / shapes["total_tokens"]
+                         if shapes["total_tokens"] else 0.0)
+
         for (q, op), tag in tagged:
+            # Work accounting is independent of whether the predictor has a model
+            # for this op, so it happens before the prediction and survives a skip.
+            k_flops, k_bytes, k_weights = kernel_work(q, op, strict=False)
+            if tag.endswith("prefill") or tag.endswith("decode"):
+                work["attn_flops"] += k_flops
+                work["attn_bytes"] += k_bytes
+                if tag.endswith("prefill"):
+                    work["prefill_flops"] += k_flops
+                else:
+                    work["decode_flops"] += k_flops
+            else:
+                work["linear_flops"] += k_flops
+                work["linear_bytes"] += k_bytes
+                work["weight_bytes"] += k_weights
+                # Exact, not apportioned: a fused GEMM's rows each belong to one
+                # request and FLOPs are linear in the row count.
+                work["prefill_flops"] += k_flops * prefill_share
+                work["decode_flops"] += k_flops * (1.0 - prefill_share)
+
             try:
                 time_ms, power_w, energy_j = predictor.predict(q, op)
             except Exception:
@@ -449,6 +570,7 @@ def run_engine(
             kv_blocks=sched.allocator.num_allocated_blocks,
             kv_utilisation=sched.allocator.utilisation,
             preemptions_total=sched.num_preemptions,
+            **work,
         ))
 
         clock += span_ms
