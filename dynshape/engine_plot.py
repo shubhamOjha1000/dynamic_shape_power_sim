@@ -634,3 +634,94 @@ def fsts_grids(trace: EngineTrace, native_dt_s: float = FSTS_NATIVE_DT_S,
     t_n, p_n = trace.resample(dt_ms=native_dt_s * 1000.0)
     t_p, p_p = trace.resample(dt_ms=plot_dt_s * 1000.0)
     return t_n, p_n, t_p, p_p
+
+
+# ---------------------------------------------------------------------------
+# The "model trace" slide figure
+# ---------------------------------------------------------------------------
+
+def peak_power_series(trace: EngineTrace, dt_ms: float = 250.0):
+    """Highest *instantaneous* kernel power reached inside each window.
+
+    Deliberately not the same quantity as `resample()`, and the difference is the
+    point.  `resample()` is an energy-conserving mean -- what a meter integrating
+    over `dt_ms` records.  This is the tallest kernel anywhere inside the same
+    window, which no meter with that aperture can see.
+
+    On a real trace the two look nothing alike: the mean sits in a narrow band
+    while the instantaneous peak spikes several times higher on prefill GEMMs
+    that saturate the tensor cores for a few hundred microseconds and are then
+    averaged away.  Size a breaker off the mean alone and the transient is
+    understated by that whole factor.
+    """
+    import numpy as np
+
+    total = trace.total_time_ms
+    if total <= 0 or not trace.iterations:
+        return np.zeros(0), np.zeros(0)
+
+    n = max(1, int(np.ceil(total / dt_ms)))
+    peak = np.zeros(n)
+    for it in trace.iterations:
+        first = min(n - 1, int(it.t_start_ms // dt_ms))
+        last = min(n - 1, int((it.t_end_ms - 1e-12) // dt_ms))
+        for k in range(first, last + 1):
+            if it.peak_power_w > peak[k]:
+                peak[k] = it.peak_power_w
+    idle = trace.config.idle_w if trace.config else 47.0
+    peak[peak == 0] = idle
+    return np.arange(n) * dt_ms / 1000.0, peak
+
+
+def plot_model_trace(trace: EngineTrace, dt_ms: float = 250.0, label: str = "",
+                     subtitle: str = "", axes=None, figsize=(11, 7)):
+    """Two stacked panels -- average power and peak power -- in the slide idiom.
+
+    Black trace, red dashed mean, blue dotted peak, boxed axes, legend inside the
+    top right.  Both panels share the time axis and the same binning; only the
+    statistic differs, which is why they are two panels rather than two lines on
+    one pair of axes.
+
+    Returns `(fig, (ax_avg, ax_peak))`.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    t_avg, avg = trace.resample(dt_ms=dt_ms)
+    t_pk, pk = peak_power_series(trace, dt_ms=dt_ms)
+    if avg.size == 0:
+        raise ValueError("trace is empty")
+
+    if axes is None:
+        fig, axes = plt.subplots(2, 1, figsize=figsize)
+    else:
+        fig = axes[0].figure
+
+    bins = f"{dt_ms:g} ms bins"
+    head = " · ".join(x for x in (label, f"{len(trace.iterations)} iterations", bins) if x)
+
+    for ax, (t, y, name) in zip(axes, ((t_avg, avg, "average power"),
+                                       (t_pk, pk, "peak power"))):
+        mean, peak = float(y.mean()), float(y.max())
+        ax.plot(t, y, lw=0.9, color="#1a1a1a", solid_joinstyle="round")
+        ax.axhline(mean, color="#d62728", ls="--", lw=1.1, label=f"mean {mean:.1f} W")
+        ax.axhline(peak, color="#3b6ea5", ls=":", lw=1.1, label=f"peak {peak:.1f} W")
+        ax.set_ylabel("node GPU power (W)", fontsize=10)
+        ax.set_title(f"{head} · {name}", fontsize=11, color="#333333")
+        ax.set_xlim(0, t[-1] if t.size else 1)
+        ax.grid(True, color="#e8e8e8", lw=0.8)
+        ax.set_axisbelow(True)
+        ax.legend(loc="upper right", fontsize=9, framealpha=1.0,
+                  edgecolor="#bbbbbb", borderpad=0.5)
+        for s in ax.spines.values():
+            s.set_color("#000000")
+            s.set_linewidth(0.9)
+
+    axes[-1].set_xlabel("time (s)", fontsize=10)
+    if subtitle:
+        fig.suptitle(subtitle, fontsize=10.5, y=0.995, color="#333333")
+    fig.patch.set_facecolor("white")
+    for ax in axes:
+        ax.set_facecolor("white")
+    fig.tight_layout()
+    return fig, tuple(axes)

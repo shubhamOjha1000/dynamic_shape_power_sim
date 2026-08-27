@@ -393,3 +393,73 @@ def test_the_peak_differs_between_the_two_grids(rewriter, predictor):
     if native.std() < 1e-9:
         pytest.skip("trace is flat; nothing for the aperture to smooth")
     assert native.max() >= plotted.max()
+
+
+# -- the slide figure: average vs peak ---------------------------------------
+
+def test_peak_series_is_not_the_mean_series(rewriter, predictor):
+    """They are different quantities, and the whole point of plotting both is
+    that they do not resemble each other: the mean is what a meter integrating
+    over the window records, the peak is the tallest kernel inside it."""
+    from dynshape.engine_plot import peak_power_series
+
+    t = run_engine(traffic(n=16, qps=250.0), rewriter, predictor, engine_cfg())
+    _, avg = t.resample(dt_ms=250.0)
+    _, pk = peak_power_series(t, dt_ms=250.0)
+    assert avg.shape == pk.shape
+    assert (pk >= avg - 1e-9).all(), "a window's peak cannot sit below its mean"
+    assert pk.max() > avg.max()
+
+
+def test_peak_series_never_exceeds_the_hottest_kernel(rewriter, predictor):
+    from dynshape.engine_plot import peak_power_series
+
+    t = run_engine(traffic(n=16, qps=250.0), rewriter, predictor, engine_cfg())
+    _, pk = peak_power_series(t, dt_ms=250.0)
+    assert pk.max() == pytest.approx(max(i.peak_power_w for i in t.iterations))
+
+
+def test_a_coarser_window_cannot_lower_the_peak_below_a_finer_one(
+        rewriter, predictor):
+    """Widening the window can only take the max over more iterations."""
+    from dynshape.engine_plot import peak_power_series
+
+    t = run_engine(traffic(n=16, qps=250.0), rewriter, predictor, engine_cfg())
+    _, fine = peak_power_series(t, dt_ms=50.0)
+    _, coarse = peak_power_series(t, dt_ms=500.0)
+    assert coarse.max() == pytest.approx(fine.max())
+
+
+def test_the_model_trace_figure_renders_both_panels(rewriter, predictor):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from dynshape.engine_plot import plot_model_trace
+
+    t = run_engine(traffic(n=16, qps=250.0), rewriter, predictor, engine_cfg())
+    fig, (a, b) = plot_model_trace(t, dt_ms=250.0, label="gpt2-a100-tp1")
+    assert "average power" in a.get_title()
+    assert "peak power" in b.get_title()
+    for ax in (a, b):
+        # black trace + a mean rule + a peak rule
+        assert len(ax.get_lines()) >= 3
+        assert ax.get_ylabel() == "node GPU power (W)"
+        assert len(ax.get_legend().get_texts()) == 2
+    assert b.get_xlabel() == "time (s)"
+    plt.close("all")
+
+
+def test_the_figure_is_white_on_purpose(rewriter, predictor):
+    """It exists to be dropped into a slide, so it commits to a white ground
+    rather than following a theme."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import to_rgba
+    from dynshape.engine_plot import plot_model_trace
+
+    t = run_engine(traffic(n=16, qps=250.0), rewriter, predictor, engine_cfg())
+    fig, axes = plot_model_trace(t, dt_ms=250.0)
+    assert to_rgba(fig.get_facecolor()) == to_rgba("white")
+    assert to_rgba(axes[0].get_facecolor()) == to_rgba("white")
+    plt.close("all")
