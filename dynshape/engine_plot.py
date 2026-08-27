@@ -600,3 +600,37 @@ def plot_power_trace_paper(series, dt_s: float = 1.0, ax=None,
     if fig is not None:
         fig.tight_layout(pad=0.35, rect=(0.0, 0.0, 1.0, 0.92))
     return ax
+
+
+#: PowerTrace-Sim's native sampling grid.  Not an analysis choice: their
+#: profiling jobs poll the sensor with
+#:
+#:     nvidia-smi --query-gpu=timestamp,power.draw,... --format=csv -lms 250
+#:
+#: so 250 ms is the finest resolution at which *any* comparison with one of
+#: their captures is meaningful.  Anything finer is simulator-only detail that no
+#: meter in that campaign ever recorded.
+FSTS_NATIVE_DT_S = 0.25
+
+#: What they plot at.  `one_second_pair` averages four native samples, and the
+#: figures are drawn from that.
+FSTS_PLOT_DT_S = 1.0
+
+
+def fsts_grids(trace: EngineTrace, native_dt_s: float = FSTS_NATIVE_DT_S,
+               plot_dt_s: float = FSTS_PLOT_DT_S):
+    """`(t_native, p_native, t_plot, p_plot)` -- their two grids.
+
+    The distinction is worth keeping visible.  They *sample* at 250 ms because
+    that is what the sensor gives, and *plot* at 1 s because four-sample means
+    are what the figures and the metrics are defined on.  A peak read off the
+    250 ms series and a peak read off the 1 s series are different numbers, and
+    only one of them matches their published tables.
+
+    Because both are box filters on aligned bins, averaging four 250 ms samples
+    and resampling once to 1 s give the same answer -- which is checked by a
+    test rather than assumed.
+    """
+    t_n, p_n = trace.resample(dt_ms=native_dt_s * 1000.0)
+    t_p, p_p = trace.resample(dt_ms=plot_dt_s * 1000.0)
+    return t_n, p_n, t_p, p_p

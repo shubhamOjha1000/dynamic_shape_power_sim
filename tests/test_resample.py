@@ -353,3 +353,43 @@ def test_the_paper_figure_rejects_an_empty_call():
     from dynshape.engine_plot import plot_power_trace_paper
     with pytest.raises(ValueError):
         plot_power_trace_paper([])
+
+
+def test_averaging_four_native_samples_equals_one_second_resampling(
+        rewriter, predictor):
+    """FSTS samples at 250 ms and plots four-sample means. Because both are box
+    filters on aligned bins, that must equal resampling straight to 1 s -- their
+    `one_second_pair` and our `resample` are the same operation."""
+    from dynshape.engine_plot import fsts_grids
+
+    t = run_engine(traffic(n=30, qps=250.0), rewriter, predictor, engine_cfg())
+    _, native, _, plotted = fsts_grids(t)
+    usable = (native.size // 4) * 4
+    if usable < 4:
+        pytest.skip("run too short for a one-second bin")
+    manual = native[:usable].reshape(-1, 4).mean(axis=1)
+    assert np.allclose(manual, plotted[:manual.size], rtol=1e-9, atol=1e-9)
+
+
+def test_the_native_grid_is_250ms_because_that_is_the_sensor_rate(
+        rewriter, predictor):
+    """`nvidia-smi ... -lms 250` in their profiling jobs. Anything finer is
+    simulator-only detail no meter in that campaign recorded."""
+    from dynshape.engine_plot import FSTS_NATIVE_DT_S, fsts_grids
+
+    assert FSTS_NATIVE_DT_S == 0.25
+    t = run_engine(traffic(n=30, qps=250.0), rewriter, predictor, engine_cfg())
+    t_n, _, _, _ = fsts_grids(t)
+    assert np.allclose(np.diff(t_n), 250.0)
+
+
+def test_the_peak_differs_between_the_two_grids(rewriter, predictor):
+    """Which is why the grid has to be reported next to any peak: a number read
+    off the 250 ms series is not the number in their 1 s tables."""
+    from dynshape.engine_plot import fsts_grids
+
+    t = run_engine(traffic(n=30, qps=250.0), rewriter, predictor, engine_cfg())
+    _, native, _, plotted = fsts_grids(t)
+    if native.std() < 1e-9:
+        pytest.skip("trace is flat; nothing for the aperture to smooth")
+    assert native.max() >= plotted.max()
