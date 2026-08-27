@@ -423,6 +423,8 @@ test suite before anything else:
 
 | notebook | what it shows |
 |---|---|
+| [`vLLM_Validation_Colab.ipynb`](notebooks/vLLM_Validation_Colab.ipynb) | **needs a GPU** — replays the same traffic through real vLLM, samples NVML, and scores predicted against measured |
+| [`EnergAIzer_LUT_Power_Colab.ipynb`](notebooks/EnergAIzer_LUT_Power_Colab.ipynb) | power from EnergAIzer's measured LUT instead of the roofline |
 | [`Serving_Engine_Power_Sim_Colab.ipynb`](notebooks/Serving_Engine_Power_Sim_Colab.ipynb) | L0 + L1 + mixed batching — arrivals, lengths, the scheduler, preemption, fused vs concatenated |
 | [`Dynamic_Shape_Power_Sim_Colab.ipynb`](notebooks/Dynamic_Shape_Power_Sim_Colab.ipynb) | the shape rewriter on its own — any `(batch, seq_len, mode)`, no engine |
 

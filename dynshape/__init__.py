@@ -63,6 +63,10 @@ from .mixed import (attention_mask, build_iteration_kernels,
                     build_iteration_kernels_tagged, fusible_mask,
                     iteration_token_shapes, mixed_report)
 from .work import WORK_FIELDS, gemm_work, kernel_work
+from .measure import (PowerSampler, bin_mean, compare_to_trace, idle_baseline)
+from .replay import (GPT2_MAX_POSITIONS, ReplayRequest, build_replay_traffic,
+                     check_fits_context, load_spec, prompt_token_ids, save_spec,
+                     spec_summary, to_spec)
 from .energaizer import (ArtifactPaths, build_estimator, build_gee_predictor,
                          flatten_lut, idle_power_table, measured_idle_power_w,
                          clone_artifact, download_lut, locate_artifact,
@@ -98,6 +102,10 @@ __all__ = [
     "build_gee_predictor", "clone_artifact", "download_lut", "locate_artifact",
     "lut_status", "build_estimator", "ArtifactPaths",
     "flatten_lut", "measured_idle_power_w", "idle_power_table",
+    # measuring a real GPU, and replaying traffic through a real engine
+    "PowerSampler", "idle_baseline", "bin_mean", "compare_to_trace",
+    "build_replay_traffic", "to_spec", "save_spec", "load_spec", "spec_summary",
+    "prompt_token_ids", "check_fits_context", "ReplayRequest", "GPT2_MAX_POSITIONS",
     # the loop
     "EngineConfig", "EngineTrace", "IterationRecord", "Segment", "run_engine",
 ]
