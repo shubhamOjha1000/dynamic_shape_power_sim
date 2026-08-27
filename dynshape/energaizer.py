@@ -355,6 +355,7 @@ def build_estimator(paths: ArtifactPaths, dvfs_aware: bool = False):
 def build_gee_predictor(root: str, lut_dir: Optional[str] = None,
                         freq: int = LUT_FREQ_MHZ,
                         reconcile: str = "report",
+                        use_precomputed_coeff: bool = False,
                         verbose: bool = True):
     """A `CachedPredictor` backed by measured tables.
 
@@ -387,8 +388,10 @@ def build_gee_predictor(root: str, lut_dir: Optional[str] = None,
               f"{LUT_FREQ_MHZ} MHz; asking for {freq} MHz extrapolates.")
 
     estimator = build_estimator(paths)
-    return CachedPredictor(backend=GeeBackend(estimator, reconcile=reconcile),
-                           freq=freq)
+    return CachedPredictor(
+        backend=GeeBackend(estimator, reconcile=reconcile,
+                           use_precomputed_coeff=use_precomputed_coeff),
+        freq=freq)
 
 
 #: The artifact is vendored inside this repo rather than published standalone,
@@ -432,3 +435,58 @@ def clone_artifact(dest: str = "energaizer-artifact",
     if not quiet:
         print(f"[energaizer] artifact at {found}")
     return found
+
+
+def benchmark_lookup(predictor, kernels, n: int = 30) -> Dict:
+    """Measure the **cold** lookup rate, so a run's cost is knowable in advance.
+
+    A measured lookup is not a table read.  EnergAIzer re-solves a small
+    quadratic program per distinct shape -- once for time, again for power -- so
+    it costs 50-300 ms where the roofline costs about a microsecond.  Multiply
+    that by the few thousand distinct shapes a serving run produces and the
+    difference between "two minutes" and "two hours" is a factor nobody should
+    discover by waiting.
+
+    `kernels` is a `[(query, op), ...]` list; only shapes the predictor has not
+    already cached are timed, since a cache hit measures nothing.
+    """
+    import time
+
+    timed = 0
+    elapsed = 0.0
+    for q, op in kernels:
+        if predictor.key(q, op) in predictor.cache:
+            continue
+        t0 = time.perf_counter()
+        predictor.predict(q, op)
+        elapsed += time.perf_counter() - t0
+        timed += 1
+        if timed >= n:
+            break
+
+    if timed == 0:
+        raise ValueError("every shape was already cached; nothing to time")
+    return {"cold_lookups_timed": timed,
+            "seconds_per_lookup": elapsed / timed,
+            "lookups_per_second": timed / elapsed}
+
+
+def project_run_minutes(seconds_per_lookup: float, distinct_shapes: int) -> float:
+    """Wall-clock minutes for a run with this many distinct shapes.
+
+    Cache *hits* are free by comparison -- a dict lookup against a QP solve -- so
+    the distinct-shape count is the whole cost model.
+    """
+    return seconds_per_lookup * distinct_shapes / 60.0
+
+
+def estimate_distinct_shapes(n_requests: int, per_request: float = 29.0) -> int:
+    """Rough distinct-shape count for a serving run of this size.
+
+    The constant is measured, not derived: a 400-request run of the reference
+    traffic reported 11,508 distinct shapes, so about 29 per request.  It scales
+    with how varied the traffic is -- every distinct KV length and every distinct
+    fused token count is a new shape -- so treat it as an order of magnitude, not
+    a prediction.  Bucketing contexts (`SchedulerConfig`) is what holds it down.
+    """
+    return int(n_requests * per_request)

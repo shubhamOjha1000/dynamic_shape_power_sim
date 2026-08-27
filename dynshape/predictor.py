@@ -109,22 +109,42 @@ class GeeBackend(Backend):
         'energy'  trust energy, derive power = E/t.  Makes per-kernel power
                   agree with every aggregate that is computed from energy.
         'power'   trust power, derive energy = P*t.
+
+    THE COST OF A LOOKUP
+    --------------------
+    Every *distinct* shape re-solves a small quadratic program (cvxpy, via
+    `gee/optimization_utils/cvxpy_qp.py`) to fit the analytical model's
+    coefficients against nearby measured entries -- once for time and again for
+    power.  That is 50-300 ms per shape, against roughly 1 microsecond for the
+    roofline.  A run with 8,000 distinct shapes is therefore twenty minutes to
+    an hour, and the cache is not an optimisation but the only reason it
+    finishes at all.
+
+    `use_precomputed_coeff=True` takes the fitted coefficients from a table
+    instead of re-solving, which is one to two orders of magnitude faster.  The
+    estimator falls back to the full solve per shape when no precomputed entry
+    exists, so it degrades in accuracy only where it has to.  It is **off by
+    default** because that is what the artifact's own end-to-end runs use, and
+    a speed knob that silently changes numbers should be opt-in.
     """
 
     name = "energaizer (measured LUT)"
     is_measured_model = True
 
-    def __init__(self, estimator, reconcile: str = "report"):
+    def __init__(self, estimator, reconcile: str = "report",
+                 use_precomputed_coeff: bool = False):
         if reconcile not in ("report", "energy", "power"):
             raise ValueError("reconcile must be 'report', 'energy' or 'power'")
         self.estimator = estimator
         self.reconcile = reconcile
+        self.use_precomputed_coeff = use_precomputed_coeff
         self.max_inconsistency = 0.0
         self.n_predictions = 0
 
     def predict(self, q: Dict, op: Tuple[str, ...], freq: int) -> Tuple[float, float, float]:
         t, p, e = self.estimator.lookup(
-            dict(q), tuple(op), target_freq=freq, lookup_target="all"
+            dict(q), tuple(op), target_freq=freq, lookup_target="all",
+            use_precomputed_coeff=self.use_precomputed_coeff,
         )
         t_ms, power_w, energy_j = _scalar(t), _scalar(p), _scalar(e)
 
@@ -271,7 +291,8 @@ def build_predictor(pkg_path: Optional[str] = None, lut_dir: Optional[str] = Non
                     gpu_yaml: Optional[str] = None, lut_yaml: Optional[str] = None,
                     freq: int = 900, force_analytic: bool = False,
                     require_measured: bool = False,
-                    reconcile: str = "report") -> CachedPredictor:
+                    reconcile: str = "report",
+                    use_precomputed_coeff: bool = False) -> CachedPredictor:
     """Real EnergAIzer if the LUT is present, otherwise the analytic fallback.
 
     By default this **degrades rather than raises**, so a Colab cell that skipped
@@ -320,5 +341,7 @@ def build_predictor(pkg_path: Optional[str] = None, lut_dir: Optional[str] = Non
     except Exception as e:                                   # pragma: no cover
         return fallback(f"could not build EnergAIzer ({e!r})")
 
-    return CachedPredictor(backend=GeeBackend(estimator, reconcile=reconcile),
-                           freq=freq)
+    return CachedPredictor(
+        backend=GeeBackend(estimator, reconcile=reconcile,
+                           use_precomputed_coeff=use_precomputed_coeff),
+        freq=freq)
