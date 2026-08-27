@@ -245,9 +245,15 @@ def test_kernel_records_are_truncated_but_iterations_are_not(rewriter, predictor
     trace = run_engine(reqs, rewriter, predictor, cfg)
     assert trace.segments
     assert trace.total_time_ms > 5.0
-    # The cutoff is applied per iteration, so an iteration that starts before
-    # the limit records all of its kernels -- including any that run past it.
-    assert all(trace.iterations[s.iteration].t_start_ms < 5.0 for s in trace.segments)
+    # The window opens at the FIRST ITERATION, not at t=0 -- under this traffic
+    # the engine idles ~25 ms waiting for the first arrival, so a window
+    # anchored at zero would close before any work happened.
+    first = trace.iterations[0].t_start_ms
+    assert first > 5.0, "fixture no longer idles first; this test checks the anchor"
+    # The cutoff is applied per iteration, so an iteration that starts inside the
+    # window records all of its kernels -- including any that run past the edge.
+    assert all(trace.iterations[s.iteration].t_start_ms < first + 5.0
+               for s in trace.segments)
     assert len(trace.iterations) > len({s.iteration for s in trace.segments})
 
 

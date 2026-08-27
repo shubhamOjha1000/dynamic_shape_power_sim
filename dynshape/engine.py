@@ -223,6 +223,11 @@ class EngineTrace:
         done = self.completed_requests
         ttfts = [r.ttft_s for r in done if r.ttft_s is not None]
         e2es = [r.e2e_s for r in done if r.e2e_s is not None]
+        # Inter-token latency is the other half of the chunked-prefill trade and
+        # the half it is actually for: TTFT alone shows only the cost, never the
+        # benefit, so a comparison reported on TTFT is guaranteed to make
+        # chunking look bad.
+        itls = [1000.0 * gap for r in done for gap in r.itl_s()]
         mixed = sum(1 for i in self.iterations if i.is_mixed)
         gen = sum(r.num_generated_tokens for r in self.requests)
         return {
@@ -242,6 +247,8 @@ class EngineTrace:
             "output_tokens_per_s": gen / (self.total_time_ms / 1000.0) if self.total_time_ms else 0.0,
             "ttft_p50_s": _pct(ttfts, 50),
             "ttft_p99_s": _pct(ttfts, 99),
+            "itl_p50_ms": _pct(itls, 50),
+            "itl_p99_ms": _pct(itls, 99),
             "e2e_p50_s": _pct(e2es, 50),
             "preemptions": self.scheduler_report.get("preemptions", 0),
             "restart_work_tokens": sum(r.restart_work_tokens for r in self.requests),
