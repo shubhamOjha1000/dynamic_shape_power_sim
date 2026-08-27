@@ -209,3 +209,147 @@ def test_a_coarse_grid_hides_the_peak_a_fine_one_shows(rewriter, predictor):
     _, fine = trace.resample(dt_ms=0.5)
     _, coarse = trace.resample(dt_ms=50.0)
     assert fine.max() > coarse.max()
+
+
+# -- PowerTrace-Sim figure style and metrics ---------------------------------
+
+def _two_traces(rewriter, predictor):
+    a = run_engine(traffic(n=14, qps=250.0), rewriter, predictor, engine_cfg())
+    b = run_engine(traffic(n=14, qps=250.0), rewriter, predictor, engine_cfg())
+    return a, b
+
+
+def test_ks_distance_matches_the_textbook_definition():
+    from dynshape.engine_plot import _ks_distance
+
+    # Identical samples -> distance 0.
+    assert _ks_distance([1, 2, 3], [1, 2, 3]) == pytest.approx(0.0)
+    # Completely separated -> distance 1.
+    assert _ks_distance([0, 0, 0], [9, 9, 9]) == pytest.approx(1.0)
+    # Half-overlapping, worked by hand.
+    assert _ks_distance([0, 1], [1, 2]) == pytest.approx(0.5)
+
+
+def test_agreement_of_a_trace_with_itself_is_perfect(rewriter, predictor):
+    from dynshape.engine_plot import trace_agreement
+
+    t = run_engine(traffic(n=14, qps=250.0), rewriter, predictor, engine_cfg())
+    m = trace_agreement(t, t, dt_s=0.02)
+    assert m["energy_error_pct"] == pytest.approx(0.0, abs=1e-9)
+    assert m["mean_bias_pct"] == pytest.approx(0.0, abs=1e-9)
+    assert m["nrmse_range"] == pytest.approx(0.0, abs=1e-9)
+    assert m["ks_agreement"] == pytest.approx(1.0)
+
+
+def test_energy_error_alone_would_hide_a_completely_different_trace(
+        rewriter, predictor):
+    """The reason FSTS reports five metrics and not one: two traces can carry
+    the same total energy while one is flat and the other swings between idle
+    and peak, and for anything that sizes a breaker those are different traces.
+    """
+    from dynshape.engine_plot import _ks_distance, trace_agreement
+
+    t = run_engine(traffic(n=14, qps=250.0), rewriter, predictor, engine_cfg())
+    _, p = t.resample(dt_ms=20.0)
+
+    # A flat line carrying exactly the same energy.
+    flat = np.full_like(p, p.mean())
+    assert abs(flat.sum() - p.sum()) / p.sum() == pytest.approx(0.0, abs=1e-9)
+    # ...and a KS distance that is nowhere near zero, if the trace varies at all.
+    if p.std() > 1e-9:
+        assert _ks_distance(p, flat) > 0.2
+
+    m = trace_agreement(t, t, dt_s=0.02)
+    assert set(m) >= {"energy_error_pct", "mean_bias_pct", "nrmse_range",
+                      "acf_r2", "ks_agreement"}
+
+
+def test_mean_bias_is_signed(rewriter, predictor):
+    """Unsigned error cannot distinguish systematic over-prediction from noise,
+    and systematic is the kind that survives aggregation."""
+    from dynshape.engine_plot import trace_agreement
+
+    t = run_engine(traffic(n=14, qps=250.0), rewriter, predictor, engine_cfg())
+    hot = run_engine(traffic(n=14, qps=250.0), rewriter, predictor,
+                     engine_cfg(idle_w=200.0))
+    m = trace_agreement(t, hot, dt_s=0.02)
+    assert m["mean_bias_pct"] > 0
+
+
+def test_agreement_refuses_a_window_too_coarse_for_the_run(rewriter, predictor):
+    from dynshape.engine_plot import trace_agreement
+
+    t = run_engine(traffic(n=6, qps=250.0), rewriter, predictor, engine_cfg())
+    with pytest.raises(ValueError, match="too short"):
+        trace_agreement(t, t, dt_s=1000.0)
+
+
+def test_the_paper_figure_renders_and_keeps_its_conventions(rewriter, predictor):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from dynshape.engine_plot import STANFORD_RED, plot_power_trace_paper
+
+    a, b = _two_traces(rewriter, predictor)
+    ax = plot_power_trace_paper([("EnergAIzer LUT", a), ("Roofline", b)],
+                                dt_s=0.02)
+    # Alpha-gradient lines are LineCollections, not Line2D.
+    assert len(ax.collections) == 2
+    assert ax.get_ylim()[0] == 0.0
+    assert ax.get_xlim()[0] == 0.0
+    labels = [t.get_text() for t in ax.get_legend().get_texts()]
+    assert labels == ["EnergAIzer LUT", "Roofline"]
+    assert "Power per GPU (W)" in ax.get_ylabel()
+    plt.close("all")
+
+
+def test_the_first_series_is_the_black_reference(rewriter, predictor):
+    """In FSTS the black line is hardware. Nothing here is, so the first series
+    is whatever the caller nominates as the reference -- and the label has to
+    say what it actually is rather than borrowing the word 'measured'."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import to_rgba
+    from dynshape.engine_plot import STANFORD_RED, plot_power_trace_paper
+
+    a, b = _two_traces(rewriter, predictor)
+    ax = plot_power_trace_paper([("ref", a), ("candidate", b)], dt_s=0.02)
+    first = ax.collections[0].get_colors()[0][:3]
+    second = ax.collections[1].get_colors()[0][:3]
+    assert tuple(first) == pytest.approx(to_rgba("black")[:3])
+    assert tuple(second) == pytest.approx(to_rgba(STANFORD_RED)[:3])
+    plt.close("all")
+
+
+def test_alpha_really_increases_along_the_line(rewriter, predictor):
+    """The convention that lets you see which way time runs where two dense
+    traces overlap."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from dynshape.engine_plot import plot_power_trace_paper
+
+    a, _ = _two_traces(rewriter, predictor)
+    ax = plot_power_trace_paper([("ref", a)], dt_s=0.02)
+    alphas = ax.collections[0].get_colors()[:, 3]
+    assert alphas[-1] > alphas[0]
+    plt.close("all")
+
+
+def test_a_single_series_still_renders(rewriter, predictor):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from dynshape.engine_plot import plot_power_trace_paper
+
+    a, _ = _two_traces(rewriter, predictor)
+    ax = plot_power_trace_paper([("only", a)], dt_s=0.02)
+    assert len(ax.collections) == 1
+    plt.close("all")
+
+
+def test_the_paper_figure_rejects_an_empty_call():
+    from dynshape.engine_plot import plot_power_trace_paper
+    with pytest.raises(ValueError):
+        plot_power_trace_paper([])

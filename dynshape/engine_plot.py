@@ -414,3 +414,189 @@ def plot_work_vector(trace: EngineTrace, ax=None, max_ms: Optional[float] = None
     ax.legend(loc="upper left", fontsize=8, framealpha=0.9)
     ax.grid(alpha=0.25)
     return ax
+
+
+# ---------------------------------------------------------------------------
+# PowerTrace-Sim (FSTS) figure style
+#
+# Ported from `power-test/plot_best_rate_traces.py` so a trace from this
+# simulator can be put next to one of theirs and compared by eye without the
+# rendering getting in the way.  Four choices in that figure are deliberate and
+# all four are reproduced:
+#
+#   one-second means      an event trace has variable-width steps; a fixed grid
+#                         is what a meter records and what two runs can share
+#   alpha gradient        opacity rises with elapsed time, so where the two
+#                         lines overlap you can still see which is which and
+#                         which direction time runs
+#   paper column size     4.4 x 2.5 inches -- the figure is drawn at the size it
+#                         will be read at, so line weights are honest
+#   legend above the axes so it never covers the trace
+#
+# The one thing that cannot be ported is the black line's *meaning*.  In FSTS it
+# is an NVML capture from real hardware.  Nothing here is that.  The closest
+# available reference is EnergAIzer's measured LUT, so that is what goes in
+# black -- and the label says so rather than borrowing the word "measured".
+# ---------------------------------------------------------------------------
+
+STANFORD_RED = "#8C1515"
+MEASURED_ALPHA_RANGE = (0.35, 0.78)
+PREDICTED_ALPHA_RANGE = (0.50, 0.98)
+
+
+def add_alpha_gradient_line(axis, x, y, *, color, linewidth, alpha_range, label):
+    """A line whose segment opacity increases across elapsed time."""
+    import numpy as np
+    from matplotlib.collections import LineCollection
+    from matplotlib.colors import to_rgba
+
+    points = np.column_stack((np.asarray(x, float), np.asarray(y, float)))
+    if points.shape[0] < 2:
+        raise ValueError("alpha-gradient lines need at least two points")
+    segments = np.stack((points[:-1], points[1:]), axis=1)
+    colors = np.tile(to_rgba(color), (segments.shape[0], 1))
+    colors[:, 3] = np.linspace(*alpha_range, segments.shape[0])
+    collection = LineCollection(segments, colors=colors, linewidths=linewidth,
+                                label=label)
+    axis.add_collection(collection)
+    return collection
+
+
+def _ks_distance(a, b) -> float:
+    """Two-sample Kolmogorov-Smirnov statistic, without pulling in scipy.
+
+    FSTS reports `1 - D` as "KS agreement": how alike the two power
+    *distributions* are, ignoring when each value occurred.  A trace can track
+    the mean well and still fail this if it never visits the right levels.
+    """
+    import numpy as np
+
+    a = np.sort(np.asarray(a, float))
+    b = np.sort(np.asarray(b, float))
+    if a.size == 0 or b.size == 0:
+        return float("nan")
+    grid = np.concatenate((a, b))
+    cdf_a = np.searchsorted(a, grid, side="right") / a.size
+    cdf_b = np.searchsorted(b, grid, side="right") / b.size
+    return float(np.max(np.abs(cdf_a - cdf_b)))
+
+
+def trace_agreement(reference: EngineTrace, candidate: EngineTrace,
+                    dt_s: float = 1.0) -> dict:
+    """FSTS's agreement metrics between two traces, on a shared one-second grid.
+
+    Reproduced from `feature-test/evaluation_core.py::trace_metrics`, because
+    the choice of metric is the interesting part: **energy error alone is not
+    enough**.  Two traces can carry identical total energy while one is a flat
+    line and the other swings between idle and peak, and for anything that sizes
+    a breaker those are entirely different traces.
+
+        energy_error_pct  totals agree
+        mean_bias_pct     signed, so systematic over/under-prediction shows
+        nrmse_range       point-by-point error against the dynamic range
+        acf_r2            does it wobble on the same *timescales*
+        ks_agreement      does it visit the same power *levels*
+    """
+    import numpy as np
+
+    _, y = reference.resample(dt_ms=dt_s * 1000.0)
+    _, p = candidate.resample(dt_ms=dt_s * 1000.0)
+    n = min(y.size, p.size)
+    if n < 4:
+        raise ValueError(f"traces are too short to compare at dt={dt_s}s "
+                         f"({n} samples); shorten dt_s or lengthen the run")
+    y, p = y[:n], p[:n]
+
+    def acf(x, max_lag):
+        xc = x - x.mean()
+        denom = xc @ xc
+        if denom <= 0:
+            return np.zeros(max_lag)
+        return np.array([xc[:-lag] @ xc[lag:] / denom
+                         for lag in range(1, max_lag + 1)])
+
+    max_lag = min(60, n - 2)
+    out = {"samples": int(n), "dt_s": dt_s,
+           "energy_error_pct": float(100 * abs(p.sum() - y.sum()) / y.sum()),
+           "mean_bias_pct": float(100 * (p.mean() - y.mean()) / y.mean()),
+           "nrmse_range": float("nan"), "nrmse_mean": float("nan"),
+           "acf_r2": float("nan"), "acf_mae": float("nan"),
+           "ks_agreement": float(1.0 - _ks_distance(y, p))}
+
+    rmse = float(np.sqrt(np.mean((p - y) ** 2)))
+    rng = float(np.ptp(y))
+    out["nrmse_range"] = rmse / rng if rng > 0 else float("nan")
+    out["nrmse_mean"] = rmse / y.mean() if y.mean() > 0 else float("nan")
+
+    if max_lag >= 2:
+        ay, ap = acf(y, max_lag), acf(p, max_lag)
+        tss = float(np.sum((ay - ay.mean()) ** 2))
+        out["acf_r2"] = float(1 - np.sum((ap - ay) ** 2) / tss) if tss > 0 else float("nan")
+        out["acf_mae"] = float(np.mean(np.abs(ap - ay)))
+    return out
+
+
+def plot_power_trace_paper(series, dt_s: float = 1.0, ax=None,
+                           figsize=(4.4, 2.5), ylim=None, title=None,
+                           time_unit: str = "auto", use_seaborn: bool = True):
+    """A PowerTrace-Sim-style power trace, drawn at the size it will be read at.
+
+    `series` is `[(label, EngineTrace), ...]`.  The first is the reference and is
+    drawn in black; the rest take Stanford red and then a fallback palette, so a
+    two-series call reproduces their figure exactly.
+
+    Everything is resampled to `dt_s` first -- variable-width events cannot be
+    overlaid, and the fixed grid is the only thing two runs can share.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.lines import Line2D
+
+    if use_seaborn:
+        try:
+            import seaborn as sns
+            sns.set_theme(style="whitegrid", context="paper", font_scale=1.18)
+        except Exception:
+            pass
+
+    series = list(series)
+    if not series:
+        raise ValueError("nothing to plot")
+
+    fig = None
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+
+    grids = []
+    for _label, tr in series:
+        t_ms, p = tr.resample(dt_ms=dt_s * 1000.0)
+        grids.append((t_ms / 1000.0, p))
+
+    span_s = max(t[-1] for t, _ in grids) if grids else 0.0
+    if time_unit == "auto":
+        time_unit = "min" if span_s >= 120 else "s"
+    divisor = 60.0 if time_unit == "min" else 1.0
+
+    palette = ["black", STANFORD_RED, "#1f4e79", "#e67e22"]
+    widths = [0.65, 0.9, 0.9, 0.9]
+    alphas = [MEASURED_ALPHA_RANGE] + [PREDICTED_ALPHA_RANGE] * (len(series) - 1)
+
+    handles = []
+    for i, ((label, _tr), (t_s, p)) in enumerate(zip(series, grids)):
+        color, lw = palette[i % len(palette)], widths[i % len(widths)]
+        add_alpha_gradient_line(ax, t_s / divisor, p, color=color,
+                                linewidth=lw, alpha_range=alphas[i], label=label)
+        handles.append(Line2D([], [], color=color, linewidth=lw, label=label))
+
+    top = ylim if ylim is not None else 1.05 * max(p.max() for _, p in grids)
+    ax.set(xlabel=f"Time ({time_unit})", ylabel="Power per GPU (W)",
+           xlim=(0.0, span_s / divisor), ylim=(0.0, top))
+    ax.grid(True, alpha=0.25)
+    ax.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 1.02),
+              frameon=False, ncol=len(handles), fontsize=8, handlelength=1.5,
+              columnspacing=0.8, borderaxespad=0.0)
+    if title:
+        ax.set_title(title, fontsize=8, pad=22)
+    if fig is not None:
+        fig.tight_layout(pad=0.35, rect=(0.0, 0.0, 1.0, 0.92))
+    return ax

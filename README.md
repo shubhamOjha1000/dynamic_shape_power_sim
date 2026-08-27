@@ -365,6 +365,31 @@ and FLOPs are linear in the row count). Bytes do not — the weight matrix is re
 batch, which is the entire point of fusing it — so the split is applied to the first and refused for
 the second.
 
+### PowerTrace-Sim's figure style, and its metrics
+
+`plot_power_trace_paper` reproduces the conventions of FSTS's
+`power-test/plot_best_rate_traces.py` so a trace from here can sit beside one of theirs:
+one-second means, alpha-gradient lines (opacity rises with elapsed time, so overlapping
+traces stay readable and you can see which way time runs), a 4.4 × 2.5 inch paper-column
+figure drawn at the size it will be read at, and the legend above the axes.
+
+`trace_agreement` ports their metrics from `feature-test/evaluation_core.py`. Which
+metrics they chose is the interesting part — **energy error alone is not enough.** Two
+traces can carry identical total energy while one is flat and the other swings between
+idle and peak, and for anything that sizes a breaker those are different traces.
+
+| metric | question |
+|---|---|
+| `energy_error_pct` | do the totals agree? |
+| `mean_bias_pct` | signed, so systematic over/under-prediction shows |
+| `nrmse_range` | point-by-point error against the dynamic range |
+| `acf_r2` | does it wobble on the same **timescales**? |
+| `ks_agreement` | does it visit the same power **levels**? |
+
+One thing does not port: in their figure the black line is an NVML capture from real
+hardware. Nothing here is that, so the first series is whatever the caller nominates as
+the reference, and its label has to say what it actually is.
+
 ### Three kinds of time
 
 `KERNEL`, `GAP` (one per iteration, at idle) and `IDLE` (waiting for an arrival). The third only
