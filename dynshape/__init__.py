@@ -71,7 +71,28 @@ from .energaizer import (ArtifactPaths, build_estimator, build_gee_predictor,
                          flatten_lut, idle_power_table, measured_idle_power_w,
                          clone_artifact, download_lut, locate_artifact,
                          lut_status)
-from .engine import EngineConfig, EngineTrace, IterationRecord, Segment, run_engine
+from .engine import (EngineConfig, EngineTrace, IterationRecord, Segment,
+                     execute_iteration, run_engine)
+
+# -- L0.5: multi-replica routing -------------------------------------------
+#
+# One arrival stream, N full model copies, one router deciding which gets what.
+# The router is the *correlation* knob: it decides whether replicas are busy at
+# the same time, and therefore what a facility meter peaks at.
+#
+#     from dynshape import FleetConfig, run_fleet, compare_routing
+#     from dynshape.fleet_plot import plot_fleet_dashboard
+#
+#     traces, table = compare_routing(reqs, rw, pred,
+#                                     policies=("round_robin", "random", "lor"),
+#                                     config=FleetConfig(num_replicas=4))
+#     table[["routing", "facility_peak_w", "coincidence_factor"]]
+
+from .routing import (LORRouter, RandomRouter, ReplicaLoad, Router,
+                      RoundRobinRouter, ROUTING_POLICIES, assign_static,
+                      build_router, routing_balance)
+from .fleet import (FleetConfig, FleetTrace, clone_requests, compare_routing,
+                    run_fleet)
 
 __version__ = "0.2.0"
 
@@ -108,4 +129,9 @@ __all__ = [
     "prompt_token_ids", "check_fits_context", "ReplayRequest", "GPT2_MAX_POSITIONS",
     # the loop
     "EngineConfig", "EngineTrace", "IterationRecord", "Segment", "run_engine",
+    "execute_iteration",
+    # L0.5 -- multi-replica routing, and the fleet loop under it
+    "Router", "RoundRobinRouter", "RandomRouter", "LORRouter", "ReplicaLoad",
+    "build_router", "assign_static", "routing_balance", "ROUTING_POLICIES",
+    "FleetConfig", "FleetTrace", "run_fleet", "compare_routing", "clone_requests",
 ]

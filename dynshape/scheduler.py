@@ -133,6 +133,18 @@ class ChunkedPrefillScheduler:
     def num_running(self) -> int:
         return len(self.allocator.allocation_map)
 
+    @property
+    def pending_tokens(self) -> int:
+        """Tokens sent here and not yet processed -- queued **and** running.
+
+        Work rather than headcount, which is the distinction a load balancer
+        cares about: an 8000-token prefill and a 50-token chat turn are "one
+        each" to Vidur's LOR and 160x apart here.  Only meaningful between
+        iterations, when `_running` holds every admitted request.
+        """
+        return sum(max(0, r.total_tokens - r.num_processed_tokens)
+                   for r in self._queue + self._running)
+
     def is_idle(self) -> bool:
         return not self._queue and not self._running
 

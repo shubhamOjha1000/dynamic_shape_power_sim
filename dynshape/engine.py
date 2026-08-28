@@ -296,7 +296,8 @@ class EngineTrace:
         return ts, ps
 
     def resample(self, dt_ms: float = 1.0, smooth_tau_ms: Optional[float] = None,
-                 include_idle: bool = True):
+                 include_idle: bool = True, total_ms: Optional[float] = None,
+                 pad_power_w: float = 0.0):
         """The trace on a **fixed time grid** -- `(times_ms, power_W)` arrays.
 
         This is what a power meter produces, and what the event-based staircase
@@ -318,12 +319,20 @@ class EngineTrace:
 
         Idle stretches are included by default: leaving them out is what makes a
         duty-cycled machine look like it draws its busy power all day.
+
+        `total_ms` extends (never truncates) the grid past this trace's own end,
+        and `pad_power_w` says what to put there.  Both exist for the fleet: to
+        add N replicas together they must share one grid, and a replica that
+        finished early is **idle, not absent** -- padding its tail with zeros
+        would have the facility total fall by 47 W every time a GPU ran out of
+        work.  A single-replica call leaves both alone and is unaffected.
         """
         import numpy as np
 
         if dt_ms <= 0:
             raise ValueError("dt_ms must be > 0")
-        total = self.total_time_ms
+        own_total = self.total_time_ms
+        total = own_total if total_ms is None else max(float(total_ms), own_total)
         if total <= 0:
             return np.zeros(0), np.zeros(0)
 
@@ -334,6 +343,10 @@ class EngineTrace:
         if include_idle:
             spans += [(s.t_start_ms, s.t_end_ms, s.energy_j)
                       for s in self.idle_segments]
+        if pad_power_w and total > own_total:
+            # The tail this trace does not cover: still a powered-on GPU.
+            spans.append((own_total, total,
+                          pad_power_w * (total - own_total) / 1000.0))
 
         for a, b, e in spans:
             if b <= a or e == 0.0:
@@ -398,6 +411,123 @@ def _pct(values: Sequence[float], q: float) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
+
+
+def execute_iteration(
+    batch: Batch,
+    sched: ChunkedPrefillScheduler,
+    rewriter: ShapeRewriter,
+    predictor: CachedPredictor,
+    cfg: EngineConfig,
+    *,
+    idx: int,
+    clock_ms: float,
+    record_kernels: bool = True,
+    segments: Optional[List[Segment]] = None,
+    skipped_ops: Optional[Dict[str, int]] = None,
+) -> IterationRecord:
+    """Price one forward pass: L2 expands it, L3 costs it, the record comes back.
+
+    Everything from `batch` to `IterationRecord` lives here and nowhere else, so
+    a single replica (`run_engine`) and a fleet of them (`fleet.run_fleet`) can
+    never drift apart in how an iteration is costed.  The caller owns the clock:
+    this function advances nothing and calls no `on_batch_end`.
+
+    `segments` and `skipped_ops`, when given, are appended to in place.
+    """
+    batch.on_schedule(clock_ms / 1000.0)
+    pieces = batch.pieces
+    shapes = iteration_token_shapes(pieces)
+
+    tagged = build_iteration_kernels_tagged(
+        rewriter, pieces,
+        fuse_linear=cfg.fuse_linear,
+        logits_last_token_only=cfg.logits_last_token_only)
+
+    t_iter = clock_ms
+    energy = 0.0
+    peak = 0.0
+    by_tag = {"fused": 0.0, "attn:prefill": 0.0, "attn:decode": 0.0,
+              "whole:prefill": 0.0, "whole:decode": 0.0}
+    n_ok = n_skip = 0
+
+    work = empty_work()
+    prefill_share = (shapes["prefill_tokens"] / shapes["total_tokens"]
+                     if shapes["total_tokens"] else 0.0)
+
+    for (q, op), tag in tagged:
+        # Work accounting is independent of whether the predictor has a model
+        # for this op, so it happens before the prediction and survives a skip.
+        k_flops, k_bytes, k_weights = kernel_work(q, op, strict=False)
+        if tag.endswith("prefill") or tag.endswith("decode"):
+            work["attn_flops"] += k_flops
+            work["attn_bytes"] += k_bytes
+            if tag.endswith("prefill"):
+                work["prefill_flops"] += k_flops
+            else:
+                work["decode_flops"] += k_flops
+        else:
+            work["linear_flops"] += k_flops
+            work["linear_bytes"] += k_bytes
+            work["weight_bytes"] += k_weights
+            # Exact, not apportioned: a fused GEMM's rows each belong to one
+            # request and FLOPs are linear in the row count.
+            work["prefill_flops"] += k_flops * prefill_share
+            work["decode_flops"] += k_flops * (1.0 - prefill_share)
+
+        try:
+            time_ms, power_w, energy_j = predictor.predict(q, op)
+        except Exception:
+            if not cfg.skip_unsupported:
+                raise
+            name = op[0] if op else "?"
+            if skipped_ops is not None:
+                skipped_ops[name] = skipped_ops.get(name, 0) + 1
+            n_skip += 1
+            continue
+
+        if record_kernels and segments is not None:
+            segments.append(Segment(
+                kind="KERNEL", t_start_ms=t_iter, time_ms=time_ms,
+                power_w=power_w, energy_j=energy_j, op=" ".join(op),
+                shape=_shape_label(q, op), tag=tag, iteration=idx))
+        t_iter += time_ms
+        energy += energy_j
+        by_tag[tag] = by_tag.get(tag, 0.0) + energy_j
+        peak = max(peak, power_w)
+        n_ok += 1
+
+    duration_ms = t_iter - clock_ms
+    gap_j = cfg.idle_w * cfg.gap_ms / 1000.0
+    if record_kernels and segments is not None and cfg.gap_ms > 0:
+        segments.append(Segment(
+            kind="GAP", t_start_ms=t_iter, time_ms=cfg.gap_ms,
+            power_w=cfg.idle_w, energy_j=gap_j, op="gap", iteration=idx))
+    total_energy = energy + (gap_j if cfg.gap_ms > 0 else 0.0)
+    span_ms = duration_ms + cfg.gap_ms
+
+    return IterationRecord(
+        idx=idx, t_start_ms=clock_ms, duration_ms=duration_ms, gap_ms=cfg.gap_ms,
+        decode_batch=shapes["decode_batch"],
+        prefill_chunks=shapes["prefill_chunks"],
+        prefill_tokens=shapes["prefill_tokens"],
+        decode_tokens=shapes["decode_batch"],
+        total_tokens=shapes["total_tokens"],
+        context_mean=shapes["context_mean"],
+        context_max=shapes["context_max"],
+        n_kernels=n_ok, n_skipped=n_skip,
+        energy_j=total_energy,
+        avg_power_w=(total_energy / (span_ms / 1000.0)) if span_ms > 0 else 0.0,
+        peak_power_w=peak,
+        energy_fused_j=by_tag["fused"],
+        energy_attn_prefill_j=by_tag["attn:prefill"] + by_tag["whole:prefill"],
+        energy_attn_decode_j=by_tag["attn:decode"] + by_tag["whole:decode"],
+        n_waiting=sched.num_waiting, n_running=sched.num_running,
+        kv_blocks=sched.allocator.num_allocated_blocks,
+        kv_utilisation=sched.allocator.utilisation,
+        preemptions_total=sched.num_preemptions,
+        **work,
+    )
 
 
 def run_engine(
@@ -479,101 +609,14 @@ def run_engine(
         if first_iteration_ms is None:
             first_iteration_ms = clock
 
-        batch.on_schedule(clock / 1000.0)
-        pieces = batch.pieces
-        shapes = iteration_token_shapes(pieces)
+        record = execute_iteration(
+            batch, sched, rewriter, predictor, cfg,
+            idx=it, clock_ms=clock,
+            record_kernels=record_kernels_now(),
+            segments=trace.segments, skipped_ops=trace.skipped_ops)
+        trace.iterations.append(record)
 
-        tagged = build_iteration_kernels_tagged(
-            rewriter, pieces,
-            fuse_linear=cfg.fuse_linear,
-            logits_last_token_only=cfg.logits_last_token_only)
-
-        t_iter = clock
-        energy = 0.0
-        peak = 0.0
-        by_tag = {"fused": 0.0, "attn:prefill": 0.0, "attn:decode": 0.0,
-                  "whole:prefill": 0.0, "whole:decode": 0.0}
-        n_ok = n_skip = 0
-        keep = record_kernels_now()
-
-        work = empty_work()
-        prefill_share = (shapes["prefill_tokens"] / shapes["total_tokens"]
-                         if shapes["total_tokens"] else 0.0)
-
-        for (q, op), tag in tagged:
-            # Work accounting is independent of whether the predictor has a model
-            # for this op, so it happens before the prediction and survives a skip.
-            k_flops, k_bytes, k_weights = kernel_work(q, op, strict=False)
-            if tag.endswith("prefill") or tag.endswith("decode"):
-                work["attn_flops"] += k_flops
-                work["attn_bytes"] += k_bytes
-                if tag.endswith("prefill"):
-                    work["prefill_flops"] += k_flops
-                else:
-                    work["decode_flops"] += k_flops
-            else:
-                work["linear_flops"] += k_flops
-                work["linear_bytes"] += k_bytes
-                work["weight_bytes"] += k_weights
-                # Exact, not apportioned: a fused GEMM's rows each belong to one
-                # request and FLOPs are linear in the row count.
-                work["prefill_flops"] += k_flops * prefill_share
-                work["decode_flops"] += k_flops * (1.0 - prefill_share)
-
-            try:
-                time_ms, power_w, energy_j = predictor.predict(q, op)
-            except Exception:
-                if not cfg.skip_unsupported:
-                    raise
-                name = op[0] if op else "?"
-                trace.skipped_ops[name] = trace.skipped_ops.get(name, 0) + 1
-                n_skip += 1
-                continue
-
-            if keep:
-                trace.segments.append(Segment(
-                    kind="KERNEL", t_start_ms=t_iter, time_ms=time_ms,
-                    power_w=power_w, energy_j=energy_j, op=" ".join(op),
-                    shape=_shape_label(q, op), tag=tag, iteration=it))
-            t_iter += time_ms
-            energy += energy_j
-            by_tag[tag] = by_tag.get(tag, 0.0) + energy_j
-            peak = max(peak, power_w)
-            n_ok += 1
-
-        duration_ms = t_iter - clock
-        gap_j = cfg.idle_w * cfg.gap_ms / 1000.0
-        if keep and cfg.gap_ms > 0:
-            trace.segments.append(Segment(
-                kind="GAP", t_start_ms=t_iter, time_ms=cfg.gap_ms,
-                power_w=cfg.idle_w, energy_j=gap_j, op="gap", iteration=it))
-        total_energy = energy + (gap_j if cfg.gap_ms > 0 else 0.0)
-        span_ms = duration_ms + cfg.gap_ms
-
-        trace.iterations.append(IterationRecord(
-            idx=it, t_start_ms=clock, duration_ms=duration_ms, gap_ms=cfg.gap_ms,
-            decode_batch=shapes["decode_batch"],
-            prefill_chunks=shapes["prefill_chunks"],
-            prefill_tokens=shapes["prefill_tokens"],
-            decode_tokens=shapes["decode_batch"],
-            total_tokens=shapes["total_tokens"],
-            context_mean=shapes["context_mean"],
-            context_max=shapes["context_max"],
-            n_kernels=n_ok, n_skipped=n_skip,
-            energy_j=total_energy,
-            avg_power_w=(total_energy / (span_ms / 1000.0)) if span_ms > 0 else 0.0,
-            peak_power_w=peak,
-            energy_fused_j=by_tag["fused"],
-            energy_attn_prefill_j=by_tag["attn:prefill"] + by_tag["whole:prefill"],
-            energy_attn_decode_j=by_tag["attn:decode"] + by_tag["whole:decode"],
-            n_waiting=sched.num_waiting, n_running=sched.num_running,
-            kv_blocks=sched.allocator.num_allocated_blocks,
-            kv_utilisation=sched.allocator.utilisation,
-            preemptions_total=sched.num_preemptions,
-            **work,
-        ))
-
-        clock += span_ms
+        clock += record.duration_ms + record.gap_ms
         batch.on_batch_end(clock / 1000.0)
         # Counted incrementally, not by rescanning: a completed request is freed
         # and never re-admitted, so it can only be counted once.

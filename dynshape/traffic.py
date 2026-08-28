@@ -42,8 +42,12 @@ from .lengths import (FixedLength, LengthGenerator, TraceLength, UniformLength,
                       ZipfLength)
 
 #: Child stream order.  Fixed, so adding a fifth consumer later cannot shift
-#: the four that already exist.
-_STREAMS = ("arrival", "length", "prefix", "spare")
+#: the four that already exist.  The fourth was reserved as `"spare"` and is now
+#: claimed by the router (`routing.py`): giving routing its own stream is what
+#: lets two routing policies be compared on *identical* arrivals, which is the
+#: attribution bug Vidur's single global seed cannot avoid.  Renaming an unused
+#: stream changes no earlier result -- `SeedSequence.spawn` is keyed by index.
+_STREAMS = ("arrival", "length", "prefix", "routing")
 
 
 def spawn_seeds(master_seed: int, n: int = len(_STREAMS)) -> List[int]:
@@ -148,7 +152,7 @@ def generate_traffic(config: Optional[TrafficConfig] = None,
     if reset_request_ids:
         reset_ids()
 
-    s_arrival, s_length, s_prefix, _ = spawn_seeds(cfg.seed)
+    s_arrival, s_length, s_prefix, _routing = spawn_seeds(cfg.seed)
     intervals = cfg.build_interval(s_arrival)
     lengths = cfg.build_length(s_length)
     prefix_rng = np.random.default_rng(s_prefix)
