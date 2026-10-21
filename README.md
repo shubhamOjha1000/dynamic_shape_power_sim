@@ -326,6 +326,40 @@ shape is a pair of offset arrays; EnergAIzer's LUT is keyed on rectangles and ha
 Under **eager** attention there is nothing to lose, which is what makes this the self-consistent
 choice for v1.
 
+### The kernels the template leaves out
+
+The template is what EnergAIzer's trace parser kept: GEMMs, softmax, layernorm and its list of
+elementwise math. A real HuggingFace forward pass launches more, and on a Colab A100 the profile
+showed **338 kernels per prefill pass and 326 per decode step against the template's 242**. The
+trace is also of `GPT2Model`, so it has **no LM head**: a 1,000-token prefill skips a
+1000 × 50257 × 768 GEMM.
+
+`extras.gpt2_hf_eager()` lists the missing kernels for the eager executor the validation
+notebooks run (one `DynamicCache` per request):
+
+| family | per pass | what launches it |
+|---|---|---|
+| gemm | +1 | the LM head, logits at every position |
+| cat | 24 | `DynamicCache.update`: K and V appended, 2 per block |
+| where / mask | 13 | the causal `torch.where` per block, + 1 building the mask |
+| elementwise | +14 | the attention-mask add per block, + 2 building the mask |
+| fill | 25 | `torch.full` scalars, 2 per block, + 1 |
+| copy | 13 | merging heads (prefill only), + 1 host-to-device copy |
+| index / embed | 6 | the two embedding lookups, + 4 aranges |
+
+EnergAIzer has no table for cat, copy, fill, where or gather, so each is priced as the closest
+kernel it does have (`scalar_add` for one input, `pointwise_add` for two). Sizes are monomials in
+the new tokens `q` and the keys attended `k`, so the fused/per-request split carries over: an extra
+that depends on `k` is per request, one that does not fuses at the summed token count.
+
+```python
+from dynshape import EngineConfig, gpt2_hf_eager
+cfg = EngineConfig(fuse_linear=False, extras=gpt2_hf_eager())   # the HF eager executor
+```
+
+Extras are tagged `<phase tag>+<name>`, so per-phase energy still adds up and kernel segments say
+which ones are extra. `extras=None` (the default) changes nothing.
+
 ### Preemption is the interesting event
 
 The KV accounting comes from Vidur rather than FSTS for one reason: **FSTS cannot preempt.** When
@@ -462,6 +496,7 @@ dynshape/
   kvcache.py      L1 — MemoryPlanner + block allocator + watermark
   scheduler.py    L1 — decode-first chunked prefill, preemption/restart
   mixed.py        L2 — a mixed batch → kernels; what fuses and what cannot
+  extras.py       L2 — the kernels the template leaves out (KV appends, masks, LM head, ...)
   engine.py       the run loop; KERNEL / GAP / IDLE
   engine_plot.py  the six-panel engine dashboard
 

@@ -60,8 +60,9 @@ from .traffic import TrafficConfig, generate_traffic, spawn_seeds, traffic_summa
 from .kvcache import (BlockAllocator, HardwareConfig, MemoryPlanner, ModelConfig)
 from .scheduler import ChunkedPrefillScheduler, SchedulerConfig
 from .mixed import (attention_mask, build_iteration_kernels,
-                    build_iteration_kernels_tagged, fusible_mask,
-                    iteration_token_shapes, mixed_report)
+                    build_iteration_kernels_tagged, extra_slots, extras_report,
+                    fusible_mask, iteration_token_shapes, mixed_report)
+from .extras import ExtraKernel, ExtraSet, Mono, gpt2_hf_eager
 from .work import WORK_FIELDS, gemm_work, kernel_work
 from .measure import (PowerSampler, bin_mean, compare_to_trace, idle_baseline)
 from .replay import (GPT2_MAX_POSITIONS, ReplayRequest, build_replay_traffic,
@@ -94,7 +95,7 @@ from .routing import (LORRouter, RandomRouter, ReplicaLoad, Router,
 from .fleet import (FleetConfig, FleetTrace, clone_requests, compare_routing,
                     run_fleet)
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     # L2 -- dynamic shapes
@@ -117,6 +118,8 @@ __all__ = [
     # L2 for mixed batches
     "build_iteration_kernels", "build_iteration_kernels_tagged",
     "fusible_mask", "attention_mask", "mixed_report", "iteration_token_shapes",
+    # the kernels the template leaves out
+    "ExtraKernel", "ExtraSet", "Mono", "gpt2_hf_eager", "extra_slots", "extras_report",
     # work accounting, independent of any power model
     "kernel_work", "gemm_work", "WORK_FIELDS",
     # the measured model

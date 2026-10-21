@@ -60,14 +60,26 @@ transformer block reads: fused layernorm, fused QKV, then (Q.K, mask, softmax,
 A.V) for request 1, the same four for request 2, ..., then the fused output
 projection.  Grouping by request rather than by kernel matters for the shape of
 the trace even though a purely additive cost model would not notice.
+
+EXTRA KERNELS
+-------------
+The template is what EnergAIzer's trace parser kept, not everything a forward
+pass launches: the KV-cache appends, the mask `where`s and adds, the scalar
+fills, the head-merging copies, the embedding lookups and the LM head are all
+missing (`extras.py`).  Pass `extras=` and they are inserted at their anchors.
+The fused/per-request split carries over: an extra whose size involves the key
+length is emitted per request, like attention; one that does not is emitted
+once at the summed token count, like a linear layer -- except inside an
+attention run, which is replayed per request whole.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 from .entities import Piece
+from .extras import ExtraKernel, ExtraSet
 from .template import Entry, ShapeRewriter, rewrite_dims, rewrite_dims_qk
 
 
@@ -174,12 +186,144 @@ def _piece_entries(rewriter: ShapeRewriter, piece: Piece,
                            seq_k=max(1, piece.key_len))
 
 
+# ---------------------------------------------------------------------------
+# Extra kernels
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ExtraSlots:
+    """Where the anchors of `extras.py` land in one template.
+
+    `at[anchor]` lists template positions; an extra is launched immediately
+    *before* the entry at its position, and position `n` means after the last
+    entry.  `inside` holds the positions strictly inside an attention run.
+    """
+
+    at: Dict[str, Tuple[int, ...]]
+    inside: FrozenSet[int]
+    n: int
+
+
+def extra_slots(rewriter: ShapeRewriter) -> ExtraSlots:
+    """Resolve the anchors against this template's attention runs.
+
+    A run is a contiguous stretch of non-fusible entries -- one per block -- so
+    nothing here is specific to GPT-2.  Memoised on the rewriter, like
+    `fusible_mask`.
+    """
+    cached = getattr(rewriter, "_extra_slots_cache", None)
+    if cached is not None:
+        return cached
+    fus = fusible_mask(rewriter)
+    n = len(fus)
+    runs: List[Tuple[int, int]] = []
+    i = 0
+    while i < n:
+        if fus[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and not fus[j]:
+            j += 1
+        runs.append((i, j))
+        i = j
+
+    def softmax_in(lo: int, hi: int) -> int:
+        for t in range(lo, hi):
+            op = rewriter.base[t][1]
+            if op and op[0].startswith("softmax"):
+                return t
+        return hi - 1
+
+    slots = ExtraSlots(
+        at={"prologue": (0,),
+            "before_attn": tuple(lo for lo, _hi in runs),
+            "after_qk": tuple(lo + 1 for lo, _hi in runs),
+            "before_softmax": tuple(softmax_in(lo, hi) for lo, hi in runs),
+            "after_attn": tuple(hi for _lo, hi in runs),
+            "epilogue": (n,)},
+        inside=frozenset(t for lo, hi in runs for t in range(lo + 1, hi)),
+        n=n)
+    try:
+        object.__setattr__(rewriter, "_extra_slots_cache", slots)
+    except Exception:      # a frozen dataclass without the slot -- just recompute
+        pass
+    return slots
+
+
+def _piece_extras(extras: ExtraSet, piece: Piece) -> List[Tuple[ExtraKernel, Entry]]:
+    """Every extra kernel kind that applies to one piece, sized for that piece.
+
+    One element per kind, not per launch: `count` and the slots multiply it out.
+    Looked up by name at call time, like `_piece_entries`, so a caller can wrap
+    both -- the notebooks' decode-context bucketing does.
+    """
+    q, k = piece.query_len, piece.key_len
+    return [(x, x.entry(q, k)) for x in extras.kernels if q >= x.min_query]
+
+
+Slotted = Dict[int, List[Tuple[str, Entry]]]
+
+
+def _extras_plan(rewriter: ShapeRewriter, extras: ExtraSet, pieces: Sequence[Piece],
+                 fuse_linear: bool, logits_last_token_only: bool
+                 ) -> Tuple[Slotted, List[Slotted]]:
+    """(shared, per_piece): extra launches keyed by the template slot they precede.
+
+    shared[s]        once per iteration, fused path only: kinds that never read
+                     the key axis, at a slot outside every attention run, sized
+                     at the summed token count of the pieces they apply to.
+    per_piece[i][s]  for piece i: everything else.
+
+    Each value is a list of (name, entry), one per launch, in spec order.
+    """
+    slots = extra_slots(rewriter)
+    shared: Slotted = {}
+    per_piece: List[Slotted] = [{} for _ in pieces]
+
+    def put(table: Slotted, s: int, x: ExtraKernel, entry: Entry) -> None:
+        table.setdefault(s, []).extend([(x.name, entry)] * x.count)
+
+    for i, piece in enumerate(pieces):
+        for x, entry in _piece_extras(extras, piece):
+            if x.logits and logits_last_token_only:
+                entry = x.entry(1, piece.key_len)      # one sampled position
+            for s in slots.at[x.anchor]:
+                if fuse_linear and not x.reads_keys and s not in slots.inside:
+                    continue                            # launched once, below
+                put(per_piece[i], s, x, entry)
+
+    if fuse_linear:
+        for x in extras.kernels:
+            if x.reads_keys:
+                continue
+            users = [p for p in pieces if p.query_len >= x.min_query]
+            if not users:
+                continue
+            tokens = (len(users) if x.logits and logits_last_token_only
+                      else sum(p.query_len for p in users))
+            entry = x.entry(tokens, tokens)            # k is not read
+            for s in slots.at[x.anchor]:
+                if s not in slots.inside:
+                    put(shared, s, x, entry)
+    return shared, per_piece
+
+
+def extras_report(rewriter: ShapeRewriter, extras: ExtraSet) -> str:
+    """One line: how many kernels the extras add to a forward pass."""
+    blocks = len(extra_slots(rewriter).at["before_attn"])
+    return (f"{extras.name or 'extras'}: +{extras.launches(2, blocks)} kernels per "
+            f"prefill pass, +{extras.launches(1, blocks)} per decode step "
+            f"({len(extras.kernels)} kinds, {blocks} blocks)")
+
+
 def build_iteration_kernels_tagged(
     rewriter: ShapeRewriter,
     pieces: Sequence[Piece],
     fuse_linear: bool = True,
     logits_last_token_only: bool = False,
     vocab: Optional[int] = None,
+    extras: Optional[ExtraSet] = None,
 ) -> List[Tuple[Entry, str]]:
     """Kernel list for one mixed iteration, each entry tagged with its origin.
 
@@ -206,7 +350,13 @@ def build_iteration_kernels_tagged(
         template is a measurement and silently rewriting it would break the
         property that every shipped shape is reproducible from a trace.  Turn it
         on when comparing against vLLM, where it is worth several percent of
-        prefill time.
+        prefill time.  It shrinks the LM head in `extras` the same way.
+
+    extras
+        Kernels the template does not have (`extras.py`), inserted at their
+        anchors.  Each is tagged `<tag>+<name>`: `<tag>` is what a template entry
+        in the same place carries, so per-phase energy still adds up, and
+        `<name>` says which extra it is.  None, the default, changes nothing.
     """
     if not pieces:
         raise ValueError("an iteration needs at least one piece")
@@ -220,11 +370,29 @@ def build_iteration_kernels_tagged(
 
     tags = [f"attn:{p.kind}" for p in pieces]
 
+    shared: Slotted = {}
+    per_piece_x: Optional[List[Slotted]] = None
+    if extras is not None:
+        shared, per_piece_x = _extras_plan(rewriter, extras, pieces, fuse_linear,
+                                           logits_last_token_only)
+
+    def put(out, items, tag):
+        if items:
+            out.extend((e, f"{tag}+{name}") for name, e in items)
+
     if not fuse_linear:
         out: List[Tuple[Entry, str]] = []
-        for piece in pieces:
+        for k, piece in enumerate(pieces):
             entries = _piece_entries(rewriter, piece)
-            out.extend((e, f"whole:{piece.kind}") for e in entries)
+            tag = f"whole:{piece.kind}"
+            if per_piece_x is None:
+                out.extend((e, tag) for e in entries)
+                continue
+            at = per_piece_x[k]
+            for i, e in enumerate(entries):
+                put(out, at.get(i), tag)
+                out.append((e, tag))
+            put(out, at.get(n), tag)
         return out
 
     fusible = fusible_mask(rewriter)
@@ -255,6 +423,13 @@ def build_iteration_kernels_tagged(
     i = 0
     while i < n:
         if fusible[i]:
+            if per_piece_x is not None:
+                put(out, shared.get(i), "fused")
+                if i == 0 or fusible[i - 1]:
+                    # At the end of an attention run, the replay below has
+                    # already placed each request's extras for this slot.
+                    for at, tag in zip(per_piece_x, tags):
+                        put(out, at.get(i), tag)
             out.append((fused[i], "fused"))
             i += 1
             continue
@@ -264,9 +439,22 @@ def build_iteration_kernels_tagged(
         while j < n and not fusible[j]:
             j += 1
         lo, hi = slot[i], slot[j - 1] + 1
-        for entries, tag in zip(per_piece, tags):
-            out.extend((e, tag) for e in entries[lo:hi])
+        if per_piece_x is None:
+            for entries, tag in zip(per_piece, tags):
+                out.extend((e, tag) for e in entries[lo:hi])
+        else:
+            put(out, shared.get(i), "fused")
+            for entries, tag, at in zip(per_piece, tags, per_piece_x):
+                for t, e in zip(range(i, j), entries[lo:hi]):
+                    put(out, at.get(t), tag)
+                    out.append((e, tag))
+                put(out, at.get(j), tag)
         i = j
+    if per_piece_x is not None:
+        put(out, shared.get(n), "fused")
+        if fusible[n - 1]:
+            for at, tag in zip(per_piece_x, tags):
+                put(out, at.get(n), tag)
     return out
 
 
@@ -276,11 +464,13 @@ def build_iteration_kernels(
     fuse_linear: bool = True,
     logits_last_token_only: bool = False,
     vocab: Optional[int] = None,
+    extras: Optional[ExtraSet] = None,
 ) -> List[Entry]:
     """`build_iteration_kernels_tagged` with the tags stripped."""
     return [entry for entry, _tag in build_iteration_kernels_tagged(
         rewriter, pieces, fuse_linear=fuse_linear,
-        logits_last_token_only=logits_last_token_only, vocab=vocab)]
+        logits_last_token_only=logits_last_token_only, vocab=vocab,
+        extras=extras)]
 
 
 @dataclass

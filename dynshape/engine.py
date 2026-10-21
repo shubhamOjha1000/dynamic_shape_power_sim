@@ -45,7 +45,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .entities import Batch, SimRequest
 from .kvcache import HardwareConfig, ModelConfig
-from .mixed import build_iteration_kernels_tagged, iteration_token_shapes, mixed_report
+from .extras import ExtraSet
+from .mixed import (build_iteration_kernels_tagged, extras_report,
+                    iteration_token_shapes, mixed_report)
 from .predictor import CachedPredictor
 from .scheduler import ChunkedPrefillScheduler, SchedulerConfig
 from .simulate import GAP_MS, IDLE_W, _shape_label
@@ -63,6 +65,11 @@ class EngineConfig:
 
     fuse_linear: bool = True
     logits_last_token_only: bool = False
+
+    #: Kernels the template does not have -- `extras.gpt2_hf_eager()` for the
+    #: HuggingFace eager executor the validation notebooks run.  None prices the
+    #: template alone.
+    extras: Optional[ExtraSet] = None
 
     gap_ms: float = GAP_MS
     idle_w: float = IDLE_W
@@ -442,7 +449,8 @@ def execute_iteration(
     tagged = build_iteration_kernels_tagged(
         rewriter, pieces,
         fuse_linear=cfg.fuse_linear,
-        logits_last_token_only=cfg.logits_last_token_only)
+        logits_last_token_only=cfg.logits_last_token_only,
+        extras=cfg.extras)
 
     t_iter = clock_ms
     energy = 0.0
@@ -456,13 +464,16 @@ def execute_iteration(
                      if shapes["total_tokens"] else 0.0)
 
     for (q, op), tag in tagged:
+        # An extra kernel is tagged `<phase tag>+<name>`; it is accounted with
+        # the phase it belongs to, and keeps its full tag on the segment.
+        phase = tag.partition("+")[0]
         # Work accounting is independent of whether the predictor has a model
         # for this op, so it happens before the prediction and survives a skip.
         k_flops, k_bytes, k_weights = kernel_work(q, op, strict=False)
-        if tag.endswith("prefill") or tag.endswith("decode"):
+        if phase.endswith("prefill") or phase.endswith("decode"):
             work["attn_flops"] += k_flops
             work["attn_bytes"] += k_bytes
-            if tag.endswith("prefill"):
+            if phase.endswith("prefill"):
                 work["prefill_flops"] += k_flops
             else:
                 work["decode_flops"] += k_flops
@@ -493,7 +504,7 @@ def execute_iteration(
                 shape=_shape_label(q, op), tag=tag, iteration=idx))
         t_iter += time_ms
         energy += energy_j
-        by_tag[tag] = by_tag.get(tag, 0.0) + energy_j
+        by_tag[phase] = by_tag.get(phase, 0.0) + energy_j
         peak = max(peak, power_w)
         n_ok += 1
 
@@ -551,6 +562,8 @@ def run_engine(
     sched = ChunkedPrefillScheduler(cfg.scheduler, cfg.model, cfg.hardware)
     trace = EngineTrace(requests=list(pending), config=cfg)
     trace.shape_report = str(mixed_report(rewriter))
+    if cfg.extras is not None:
+        trace.shape_report += "; " + extras_report(rewriter, cfg.extras)
     trace.kernels_truncated_at_ms = cfg.record_kernels_until_ms
 
     clock = 0.0

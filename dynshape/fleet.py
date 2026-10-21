@@ -592,8 +592,10 @@ def run_fleet(
             print(f"  step {steps:>7}  t={replica.clock / 1000.0:7.2f}s  "
                   f"done {n_done}/{len(pending)}  routed {cursor}", flush=True)
 
-    from .mixed import mixed_report
+    from .mixed import extras_report, mixed_report
     shape_report = str(mixed_report(rewriter))
+    if cfg.engine.extras is not None:
+        shape_report += "; " + extras_report(rewriter, cfg.engine.extras)
     traces = [r.finish(predictor, shape_report) for r in reps]
 
     return FleetTrace(
