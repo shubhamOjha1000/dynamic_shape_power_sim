@@ -95,7 +95,7 @@ from .routing import (LORRouter, RandomRouter, ReplicaLoad, Router,
 from .fleet import (FleetConfig, FleetTrace, clone_requests, compare_routing,
                     run_fleet)
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     # L2 -- dynamic shapes

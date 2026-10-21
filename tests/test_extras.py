@@ -309,3 +309,25 @@ def test_the_engine_charges_a_measured_price(rewriter, predictor):
     heads = [s for s in trace.segments if s.tag.endswith("+lm_head")]
     assert heads and all(s.time_ms == pytest.approx(500.0) for s in heads)
     assert all(s.power_w == pytest.approx(cfg.idle_w) for s in heads)
+
+
+# -- CPU time per step -------------------------------------------------------------
+
+def test_host_time_stretches_a_step_and_charges_the_wait(rewriter, predictor):
+    """A step lasts max(GPU kernel time, CPU time); the GPU waits out the rest
+    just above idle.  Defaults are zero, so every other test is unaffected."""
+    cfg = EngineConfig(scheduler=SchedulerConfig(chunk_size=512, max_num_seqs=16,
+                                                 max_tokens=4096),
+                       fuse_linear=False, record_kernels_until_ms=None,
+                       host_ms_per_pass=100.0, host_ms_per_token=0.5,
+                       host_ms_per_step=7.0, host_wait_w=2.0)
+    trace = run_engine(_traffic(2), rewriter, predictor, cfg)
+    gap_j = cfg.idle_w * cfg.gap_ms / 1000.0
+    for it in trace.iterations:
+        passes = it.prefill_chunks + it.decode_batch
+        host = 7.0 + 100.0 * passes + 0.5 * it.total_tokens
+        assert it.duration_ms == pytest.approx(host)          # analytic kernels are faster
+        kernels = it.energy_fused_j + it.energy_attn_prefill_j + it.energy_attn_decode_j
+        waits = [s for s in trace.segments if s.kind == "HOST" and s.iteration == it.idx]
+        assert len(waits) == 1 and waits[0].power_w == pytest.approx(cfg.idle_w + 2.0)
+        assert kernels + waits[0].energy_j + gap_j == pytest.approx(it.energy_j, rel=1e-9)

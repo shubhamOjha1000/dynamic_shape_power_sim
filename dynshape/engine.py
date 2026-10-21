@@ -17,14 +17,16 @@ derive from the same source by construction.  Vidur ships its own execution-time
 predictor; running both would let the two disagree about how long every
 iteration lasted, and there would be no principled way to reconcile them.
 
-THREE KINDS OF TIME
--------------------
+FOUR KINDS OF TIME
+------------------
     KERNEL   a launched kernel, at its predicted power
+    HOST     the GPU waiting for the CPU to finish issuing the step, when the
+             CPU is slower than the kernels (`host_ms_*`; zero by default)
     GAP      the inter-iteration synchronisation point -- scheduler and
              sampling -- at idle power, one per iteration, not one per kernel
     IDLE     the engine has nothing to run and is waiting for an arrival
 
-The third only exists once there is a real arrival process, and it is the reason
+IDLE only exists once there is a real arrival process, and it is the reason
 average power over wall-clock is not the same as average power over busy time.
 At low load a GPU spends most of its life in IDLE at ~47 W, and a report that
 quietly averages only the busy segments will overstate facility draw
@@ -70,6 +72,16 @@ class EngineConfig:
     #: HuggingFace eager executor the validation notebooks run.  None prices the
     #: template alone.
     extras: Optional[ExtraSet] = None
+
+    #: CPU time to issue a step, for executors whose host work outlasts the GPU's
+    #: (HuggingFace eager GPT-2: ~16 ms per forward pass).  A step lasts at least
+    #:     host_ms_per_step + host_ms_per_pass * passes + host_ms_per_token * tokens
+    #: (passes = pieces in the step, one forward pass each), and the GPU waits out
+    #: the difference at idle_w + host_wait_w.  All zero: kernel time alone.
+    host_ms_per_pass: float = 0.0
+    host_ms_per_token: float = 0.0
+    host_ms_per_step: float = 0.0
+    host_wait_w: float = 0.0
 
     gap_ms: float = GAP_MS
     idle_w: float = IDLE_W
@@ -535,13 +547,27 @@ def execute_iteration(
         peak = max(peak, power_w)
         n_ok += 1
 
+    # HOST: the CPU's time to issue this step.  An eager executor launches kernels
+    # asynchronously, so the step lasts max(GPU kernel time, CPU time), and the GPU
+    # waits out any difference just above idle.
+    host_ms = (cfg.host_ms_per_step + cfg.host_ms_per_pass * len(pieces)
+               + cfg.host_ms_per_token * shapes["total_tokens"])
+    wait_ms = max(0.0, host_ms - (t_iter - clock_ms))
+    wait_w = cfg.idle_w + cfg.host_wait_w
+    wait_j = wait_w * wait_ms / 1000.0
+    if wait_ms > 0 and record_kernels and segments is not None:
+        segments.append(Segment(
+            kind="HOST", t_start_ms=t_iter, time_ms=wait_ms,
+            power_w=wait_w, energy_j=wait_j, op="host", iteration=idx))
+    t_iter += wait_ms
+
     duration_ms = t_iter - clock_ms
     gap_j = cfg.idle_w * cfg.gap_ms / 1000.0
     if record_kernels and segments is not None and cfg.gap_ms > 0:
         segments.append(Segment(
             kind="GAP", t_start_ms=t_iter, time_ms=cfg.gap_ms,
             power_w=cfg.idle_w, energy_j=gap_j, op="gap", iteration=idx))
-    total_energy = energy + (gap_j if cfg.gap_ms > 0 else 0.0)
+    total_energy = energy + wait_j + (gap_j if cfg.gap_ms > 0 else 0.0)
     span_ms = duration_ms + cfg.gap_ms
 
     return IterationRecord(
