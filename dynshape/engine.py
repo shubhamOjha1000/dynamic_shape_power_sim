@@ -420,6 +420,32 @@ def _pct(values: Sequence[float], q: float) -> Optional[float]:
 # ---------------------------------------------------------------------------
 
 
+def price_kernel(
+    predictor: CachedPredictor,
+    q: Dict,
+    op: Tuple[str, ...],
+    tag: str = "",
+    extras: Optional[ExtraSet] = None,
+    idle_w: float = IDLE_W,
+) -> Tuple[float, float, float]:
+    """(time_ms, power_W, energy_J) for one kernel of an iteration.
+
+    An extra kernel that carries a measured price (`ExtraKernel.price`) is priced
+    from it: its measured time, and its measured energy above idle on top of
+    `idle_w` for that time -- the floor the run charges for idle and gaps, so its
+    energy above idle comes out as exactly the measured number.  Everything else
+    goes to the predictor.
+    """
+    name = tag.partition("+")[2]
+    if name and extras is not None:
+        x = extras.kernel(name)
+        if x is not None and x.price is not None:
+            time_ms, dyn_mj = x.price(q[x.price.field])
+            energy_j = (idle_w * time_ms + dyn_mj) / 1000.0
+            return time_ms, energy_j / (time_ms / 1000.0), energy_j
+    return predictor.predict(q, op)
+
+
 def execute_iteration(
     batch: Batch,
     sched: ChunkedPrefillScheduler,
@@ -487,7 +513,8 @@ def execute_iteration(
             work["decode_flops"] += k_flops * (1.0 - prefill_share)
 
         try:
-            time_ms, power_w, energy_j = predictor.predict(q, op)
+            time_ms, power_w, energy_j = price_kernel(predictor, q, op, tag,
+                                                      cfg.extras, cfg.idle_w)
         except Exception:
             if not cfg.skip_unsupported:
                 raise

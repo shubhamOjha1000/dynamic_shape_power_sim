@@ -360,6 +360,14 @@ cfg = EngineConfig(fuse_linear=False, extras=gpt2_hf_eager())   # the HF eager e
 Extras are tagged `<phase tag>+<name>`, so per-phase energy still adds up and kernel segments say
 which ones are extra. `extras=None` (the default) changes nothing.
 
+**Measured prices.** Where a stand-in is badly off, an extra can carry a `MeasuredPrice`: GPU time
+and energy above idle timed on real hardware at a few sizes, interpolated between them.
+`price_kernel` (which the engine uses for every kernel) prefers it to the predictor. The LM head
+needs one: GPT-2's vocabulary of 50,257 is odd, so cuBLAS falls back to slow unaligned kernels, and
+a Colab A100 runs it 3.4-3.8× slower than EnergAIzer predicts. `extras.with_prices({...})` attaches
+prices; `notebooks/A100_Validation_Colab.ipynb` times the LM head and the two mask kernels on the
+card it runs on.
+
 ### Preemption is the interesting event
 
 The KV accounting comes from Vidur rather than FSTS for one reason: **FSTS cannot preempt.** When

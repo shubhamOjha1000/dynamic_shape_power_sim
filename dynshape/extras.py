@@ -44,6 +44,16 @@ add it is priced as.  Elementwise sizes are floored at `ELEMENTWISE_MIN_DIM`,
 because EnergAIzer's elementwise tables start at 127 elements; a one-element
 fill is the same single launch as a 128-element one.
 
+MEASURED PRICES
+---------------
+Where a stand-in is badly off, an extra can carry a `MeasuredPrice` instead: its
+GPU time and energy above idle, timed on real hardware at a few sizes and
+interpolated between them.  `engine.price_kernel` prefers it to the predictor.
+The LM head is the case that forced this: GPT-2's vocabulary of 50,257 is odd,
+so cuBLAS falls back to slow unaligned kernels, and a Colab A100 runs it 3.4-3.8x
+slower than EnergAIzer predicts.  `ExtraSet.with_prices` attaches prices; the
+validation notebook times them on the card it runs on.
+
 SIZES
 -----
 Every numeric field is a monomial in the two numbers a piece carries,
@@ -70,9 +80,11 @@ template's attention runs (the contiguous non-fusible entries, one per block):
 
 from __future__ import annotations
 
+import bisect
 import json
-from dataclasses import dataclass
-from typing import Dict, Mapping, Tuple
+import math
+from dataclasses import dataclass, replace
+from typing import Dict, Mapping, Optional, Tuple
 
 from .template import Entry, _round_pos
 
@@ -120,6 +132,71 @@ def _to_json_value(v):
 
 
 @dataclass(frozen=True)
+class MeasuredPrice:
+    """One kernel's cost measured on real hardware, against one size field.
+
+    field    the entry field that sizes the kernel: `dimM` for the LM head, `dim`
+             for an elementwise stand-in (after its 128-element floor)
+    sizes    the measured sizes, strictly increasing
+    time_ms  GPU time of one launch at each size
+    dyn_mj   energy above idle of one launch at each size, in mJ
+
+    Between measured sizes, time is interpolated on log-log axes and power above
+    idle linearly in log size.  Below the smallest size the smallest point is
+    used, since a launch costs at least that; above the largest, time grows in
+    proportion to size at the last point's power, as a bandwidth- or compute-bound
+    kernel does.  A negative measured energy (noise on a tiny kernel) reads as
+    zero power.
+    """
+
+    field: str
+    sizes: Tuple[float, ...]
+    time_ms: Tuple[float, ...]
+    dyn_mj: Tuple[float, ...]
+    source: str = ""
+
+    def __post_init__(self):
+        sizes = tuple(float(s) for s in self.sizes)
+        time_ms = tuple(float(t) for t in self.time_ms)
+        dyn_mj = tuple(float(e) for e in self.dyn_mj)
+        if not sizes or not (len(sizes) == len(time_ms) == len(dyn_mj)):
+            raise ValueError("sizes, time_ms and dyn_mj must be non-empty and the same length")
+        if any(s <= 0 for s in sizes) or any(b <= a for a, b in zip(sizes, sizes[1:])):
+            raise ValueError("sizes must be positive and strictly increasing")
+        if any(t <= 0 for t in time_ms):
+            raise ValueError("every measured time must be positive")
+        object.__setattr__(self, "sizes", sizes)
+        object.__setattr__(self, "time_ms", time_ms)
+        object.__setattr__(self, "dyn_mj", dyn_mj)
+
+    def __call__(self, size: float) -> Tuple[float, float]:
+        """(time_ms, energy above idle in mJ) of one launch at `size`."""
+        s, t = self.sizes, self.time_ms
+        power = [max(0.0, e / tt) for e, tt in zip(self.dyn_mj, t)]      # W = mJ / ms
+        x = float(size)
+        if x <= s[0]:
+            ms, w = t[0], power[0]
+        elif x >= s[-1]:
+            ms, w = t[-1] * x / s[-1], power[-1]
+        else:
+            i = bisect.bisect_right(s, x) - 1
+            f = math.log(x / s[i]) / math.log(s[i + 1] / s[i])
+            ms = math.exp(math.log(t[i]) + f * math.log(t[i + 1] / t[i]))
+            w = power[i] + f * (power[i + 1] - power[i])
+        return ms, w * ms
+
+    def to_dict(self) -> Dict:
+        return {"field": self.field, "sizes": list(self.sizes),
+                "time_ms": list(self.time_ms), "dyn_mj": list(self.dyn_mj),
+                "source": self.source}
+
+    @classmethod
+    def from_dict(cls, d: Mapping) -> "MeasuredPrice":
+        return cls(field=d["field"], sizes=tuple(d["sizes"]), time_ms=tuple(d["time_ms"]),
+                   dyn_mj=tuple(d["dyn_mj"]), source=d.get("source", ""))
+
+
+@dataclass(frozen=True)
 class ExtraKernel:
     """One kind of kernel the template does not have.
 
@@ -130,6 +207,7 @@ class ExtraKernel:
     count      launches at each slot (2 for the K and V appends)
     min_query  launched only for pieces with at least this many new tokens
     logits     True for the LM head, so `logits_last_token_only` can shrink it
+    price      a `MeasuredPrice` that replaces the predictor for this kernel
     """
 
     name: str
@@ -141,6 +219,7 @@ class ExtraKernel:
     min_query: int = 1
     logits: bool = False
     note: str = ""
+    price: Optional[MeasuredPrice] = None
 
     def __post_init__(self):
         if self.anchor not in ANCHORS:
@@ -150,6 +229,12 @@ class ExtraKernel:
         pairs = self.fields.items() if isinstance(self.fields, Mapping) else self.fields
         object.__setattr__(self, "op", tuple(self.op))
         object.__setattr__(self, "fields", tuple((str(k), _as_value(v)) for k, v in pairs))
+        if self.price is not None:
+            if not isinstance(self.price, MeasuredPrice):
+                raise ValueError(f"{self.name}: price must be a MeasuredPrice")
+            if self.price.field not in dict(self.fields):
+                raise ValueError(f"{self.name}: priced by {self.price.field!r}, "
+                                 f"which is not one of its fields")
 
     @property
     def reads_keys(self) -> bool:
@@ -178,14 +263,17 @@ class ExtraKernel:
                 "op": list(self.op),
                 "fields": {k: _to_json_value(v) for k, v in self.fields},
                 "count": self.count, "min_query": self.min_query,
-                "logits": self.logits, "note": self.note}
+                "logits": self.logits, "note": self.note,
+                "price": self.price.to_dict() if self.price is not None else None}
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "ExtraKernel":
+        price = d.get("price")
         return cls(name=d["name"], family=d["family"], anchor=d["anchor"],
                    op=tuple(d["op"]), fields=dict(d["fields"]),
                    count=int(d.get("count", 1)), min_query=int(d.get("min_query", 1)),
-                   logits=bool(d.get("logits", False)), note=d.get("note", ""))
+                   logits=bool(d.get("logits", False)), note=d.get("note", ""),
+                   price=MeasuredPrice.from_dict(price) if price else None)
 
 
 @dataclass(frozen=True)
@@ -202,6 +290,25 @@ class ExtraSet:
         dup = sorted({n for n in names if names.count(n) > 1})
         if dup:
             raise ValueError(f"duplicate extra kernel names: {dup}")
+        object.__setattr__(self, "_by_name", {x.name: x for x in self.kernels})
+
+    def kernel(self, name: str) -> Optional[ExtraKernel]:
+        """The kind called `name`, or None."""
+        return self._by_name.get(name)
+
+    @property
+    def priced(self) -> Tuple[str, ...]:
+        """Names of the kinds that carry a measured price."""
+        return tuple(x.name for x in self.kernels if x.price is not None)
+
+    def with_prices(self, prices: Mapping[str, Optional[MeasuredPrice]]) -> "ExtraSet":
+        """A copy with measured prices attached by name; None removes a price."""
+        unknown = sorted(set(prices) - set(self._by_name))
+        if unknown:
+            raise ValueError(f"no extra kernel named {unknown}")
+        return ExtraSet(tuple(replace(x, price=prices[x.name]) if x.name in prices else x
+                              for x in self.kernels),
+                        name=self.name, source=self.source)
 
     def launches(self, query_len: int, n_blocks: int) -> int:
         """Extra kernels one forward pass launches for a piece of `query_len` tokens."""

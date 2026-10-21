@@ -4,10 +4,10 @@ the guarantee that adding them never changes a template entry.
 
 import pytest
 
-from dynshape.engine import EngineConfig, run_engine
+from dynshape.engine import EngineConfig, price_kernel, run_engine
 from dynshape.entities import Piece, reset_ids
-from dynshape.extras import (ELEMENTWISE_MIN_DIM, ExtraKernel, ExtraSet, Mono,
-                             gpt2_hf_eager)
+from dynshape.extras import (ELEMENTWISE_MIN_DIM, ExtraKernel, ExtraSet, MeasuredPrice,
+                             Mono, gpt2_hf_eager)
 from dynshape.mixed import (_piece_extras, build_iteration_kernels_tagged,
                             extra_slots, fusible_mask)
 from dynshape.scheduler import SchedulerConfig
@@ -230,3 +230,82 @@ def test_the_engine_prices_extras_and_phase_energy_still_adds_up(rewriter, predi
         parts = it.energy_fused_j + it.energy_attn_prefill_j + it.energy_attn_decode_j
         assert parts + gap_j == pytest.approx(it.energy_j, rel=1e-9)
     assert any("+" in s.tag for s in trace.segments if s.kind == "KERNEL")
+
+
+# -- measured prices -------------------------------------------------------------
+
+P = MeasuredPrice(field="dimM", sizes=(1, 100, 1000), time_ms=(0.1, 1.0, 4.0),
+                  dyn_mj=(1.0, 50.0, 400.0))
+
+
+def test_a_measured_price_hits_its_points_and_interpolates_on_log_axes():
+    for s, t, e in zip(P.sizes, P.time_ms, P.dyn_mj):
+        ms, mj = P(s)
+        assert ms == pytest.approx(t) and mj == pytest.approx(e)
+    ms, mj = P(10)                        # halfway between 1 and 100 on a log axis
+    assert ms == pytest.approx((0.1 * 1.0) ** 0.5)
+    assert mj == pytest.approx(30.0 * ms)  # power halfway between 10 W and 50 W
+
+
+def test_a_measured_price_clamps_below_and_scales_above():
+    assert P(0.5) == P(1)
+    ms, mj = P(2000)
+    assert ms == pytest.approx(8.0) and mj == pytest.approx(800.0)
+
+
+def test_negative_measured_energy_reads_as_zero_power():
+    p = MeasuredPrice(field="dim", sizes=(128,), time_ms=(0.003,), dyn_mj=(-0.001,))
+    assert p(128) == (0.003, 0.0)
+
+
+def test_bad_prices_are_refused():
+    with pytest.raises(ValueError):
+        MeasuredPrice(field="dim", sizes=(10, 5), time_ms=(1, 1), dyn_mj=(1, 1))
+    with pytest.raises(ValueError):
+        MeasuredPrice(field="dim", sizes=(1,), time_ms=(0,), dyn_mj=(1,))
+    with pytest.raises(ValueError):
+        X.with_prices({"no_such_kernel": P})
+    with pytest.raises(ValueError):           # the LM head has no `dim` field
+        X.with_prices({"lm_head": MeasuredPrice(field="dim", sizes=(1,), time_ms=(1,),
+                                                dyn_mj=(1,))})
+
+
+def test_prices_attach_by_name_and_survive_a_json_round_trip(tmp_path):
+    priced = X.with_prices({"lm_head": P})
+    assert priced.priced == ("lm_head",) and X.priced == ()
+    assert priced.kernel("lm_head").price == P
+    path = str(tmp_path / "priced.json")
+    priced.save(path)
+    assert ExtraSet.load(path) == priced
+    assert priced.with_prices({"lm_head": None}) == X
+
+
+def test_price_kernel_uses_a_measured_price_and_nothing_else(predictor):
+    priced = X.with_prices({"lm_head": P})
+    q, op = priced.kernel("lm_head").entry(100, 100)
+    t_ms, p_w, e_j = price_kernel(predictor, q, op, "whole:prefill+lm_head", priced,
+                                  idle_w=50.0)
+    assert t_ms == pytest.approx(1.0)
+    assert e_j == pytest.approx((50.0 * 1.0 + 50.0) / 1000.0)
+    assert p_w == pytest.approx(e_j / 0.001)
+    # Unpriced extras and template entries still go to the predictor.
+    cq, cop = priced.kernel("kv_cache_cat").entry(1, 513)
+    assert price_kernel(predictor, cq, cop, "whole:decode+kv_cache_cat", priced) == \
+        predictor.predict(cq, cop)
+    assert price_kernel(predictor, q, op, "whole:prefill", priced) == predictor.predict(q, op)
+
+
+def test_the_engine_charges_a_measured_price(rewriter, predictor):
+    slow = MeasuredPrice(field="dimM", sizes=(1, 1e6), time_ms=(500.0, 500.0),
+                         dyn_mj=(0.0, 0.0))
+    cfg = EngineConfig(scheduler=SchedulerConfig(chunk_size=512, max_num_seqs=16,
+                                                 max_tokens=4096),
+                       fuse_linear=False, record_kernels_until_ms=None,
+                       extras=X.with_prices({"lm_head": slow}))
+    trace = run_engine(_traffic(2), rewriter, predictor, cfg)
+    assert "measured prices for lm_head" in trace.shape_report
+    for it in trace.iterations:
+        assert it.duration_ms >= 500.0 * (it.prefill_chunks + it.decode_batch)
+    heads = [s for s in trace.segments if s.tag.endswith("+lm_head")]
+    assert heads and all(s.time_ms == pytest.approx(500.0) for s in heads)
+    assert all(s.power_w == pytest.approx(cfg.idle_w) for s in heads)

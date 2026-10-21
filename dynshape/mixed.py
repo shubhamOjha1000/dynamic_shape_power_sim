@@ -312,9 +312,10 @@ def _extras_plan(rewriter: ShapeRewriter, extras: ExtraSet, pieces: Sequence[Pie
 def extras_report(rewriter: ShapeRewriter, extras: ExtraSet) -> str:
     """One line: how many kernels the extras add to a forward pass."""
     blocks = len(extra_slots(rewriter).at["before_attn"])
+    priced = f"; measured prices for {', '.join(extras.priced)}" if extras.priced else ""
     return (f"{extras.name or 'extras'}: +{extras.launches(2, blocks)} kernels per "
             f"prefill pass, +{extras.launches(1, blocks)} per decode step "
-            f"({len(extras.kernels)} kinds, {blocks} blocks)")
+            f"({len(extras.kernels)} kinds, {blocks} blocks){priced}")
 
 
 def build_iteration_kernels_tagged(
