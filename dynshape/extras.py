@@ -446,6 +446,11 @@ def llama_hf_eager(hidden: int = 5120, kv_hidden: int = 5120,
         x("merge_heads_copy", "copy", "after_attn", "scalar_add", Mono(hidden, 1, 0),
           min_query=2, note="transpose(1, 2).contiguous(); free for a single token"),
     )
+    if kv_hidden < hidden:
+        # Grouped-query attention: eager attention expands K and V to every query
+        # head (repeat_kv: expand + reshape, a copy), k x heads x head_dim each.
+        kernels += (x("repeat_kv", "copy", "before_attn", "scalar_add", Mono(hidden, 0, 1),
+                      count=2, note="repeat_kv on K, then V: a copy to all query heads"),)
     return ExtraSet(kernels, name="llama-hf-eager",
                     source="HuggingFace LLaMA, eager attention, DynamicCache; "
                            "predicted from transformers' source")

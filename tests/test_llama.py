@@ -152,3 +152,49 @@ def test_the_shape_reads_a_hf_config():
     assert s == LlamaShape(name="llama-2-13b-hf")
     assert abs(s.parameters() / 1e9 - 13.0) < 0.1
     assert s.kv_bytes_per_token() == 2 * 2 * 5120 * 40
+
+
+# -- Qwen3: QK-norm and grouped-query attention ----------------------------------
+
+from dynshape.llama import QWEN3_14B, llama_extras
+
+TINY_QWEN = LlamaShape(name="tiny-qwen3", hidden=256, heads=4, kv_heads=2, intermediate=688,
+                       layers=2, vocab=32000, max_position=2048, head_size=64, qk_norm=True)
+
+
+def test_the_qwen3_14b_template_and_extras_have_the_predicted_counts(tmp_path):
+    assert n_template_entries(QWEN3_14B) == 2418
+    assert len(llama_template(QWEN3_14B, 1, 128)) == 2418
+    x = llama_extras(QWEN3_14B)
+    assert x.launches(1000, 40) == 210 and x.launches(1, 40) == 170
+    rw = rewriter_for(QWEN3_14B, tmp_path)
+    assert mixed_report(rw).classes_agree and mixed_report(rw).n_runs == 40
+    for piece, want in ((pre(1000), 2628), (dec(512), 2588)):
+        assert len(build_iteration_kernels_tagged(rw, [piece], fuse_linear=False, extras=x)) == want
+
+
+def test_qwen3_shapes_use_the_kv_and_head_widths(tmp_path):
+    rw = rewriter_for(TINY_QWEN, tmp_path)
+    for b, s in ((1, 1000), (3, 77)):
+        assert rw.expand(b, s, "prefill") == llama_template(TINY_QWEN, b, s)
+    x = llama_extras(TINY_QWEN)
+    by = {}
+    for (q, _op), tag in build_iteration_kernels_tagged(rw, [dec(100)], fuse_linear=False,
+                                                        extras=x):
+        by.setdefault(tag.partition("+")[2], []).append(q)
+    assert {q["dim"] for q in by["kv_cache_cat"]} == {2 * 64 * 101}     # kv_heads x head_dim x k
+    assert {q["dim"] for q in by["repeat_kv"]} == {4 * 64 * 101}        # every query head
+    gemms = [q for q in by[""] if "dimN" in q and q["batch"] == 1 and q["dimK"] == 256]
+    assert sorted({q["dimN"] for q in gemms}) == [128, 256, 688, 32000]  # k/v, q, gate/up, head
+
+
+def test_a_qwen3_config_reads_its_head_dim_and_qk_norm():
+    class Cfg:
+        _name_or_path, model_type = "Qwen/Qwen3-14B", "qwen3"
+        hidden_size, num_attention_heads, num_key_value_heads, head_dim = 5120, 40, 8, 128
+        intermediate_size, num_hidden_layers = 17408, 40
+        vocab_size, max_position_embeddings, tie_word_embeddings = 151936, 40960, False
+    s = LlamaShape.from_hf_config(Cfg())
+    assert s == QWEN3_14B
+    assert abs(s.parameters() / 1e9 - 14.8) < 0.1
+    assert s.kv_bytes_per_token() == 2 * 2 * 1024 * 40

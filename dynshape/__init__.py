@@ -64,8 +64,8 @@ from .mixed import (attention_mask, build_iteration_kernels,
                     fusible_mask, iteration_token_shapes, mixed_report)
 from .extras import (ExtraKernel, ExtraSet, MeasuredPrice, Mono, gpt2_hf_eager,
                      llama_hf_eager)
-from .llama import (LLAMA_2_7B, LLAMA_2_13B, LlamaShape, llama_template,
-                    write_llama_templates)
+from .llama import (LLAMA_2_7B, LLAMA_2_13B, QWEN3_14B, LlamaShape, llama_extras,
+                    llama_template, write_llama_templates)
 from .work import WORK_FIELDS, gemm_work, kernel_work
 from .measure import (PowerSampler, bin_mean, compare_to_trace, idle_baseline)
 from .replay import (GPT2_MAX_POSITIONS, ReplayRequest, build_replay_traffic,
@@ -98,7 +98,7 @@ from .routing import (LORRouter, RandomRouter, ReplicaLoad, Router,
 from .fleet import (FleetConfig, FleetTrace, clone_requests, compare_routing,
                     run_fleet)
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = [
     # L2 -- dynamic shapes
@@ -125,7 +125,8 @@ __all__ = [
     "ExtraKernel", "ExtraSet", "MeasuredPrice", "Mono", "gpt2_hf_eager", "extra_slots",
     "extras_report", "price_kernel",
     # LLaMA-family templates, generated from the model shape
-    "LlamaShape", "LLAMA_2_7B", "LLAMA_2_13B", "llama_template", "write_llama_templates",
+    "LlamaShape", "LLAMA_2_7B", "LLAMA_2_13B", "QWEN3_14B", "llama_template",
+    "llama_extras", "write_llama_templates",
     "llama_hf_eager",
     # work accounting, independent of any power model
     "kernel_work", "gemm_work", "WORK_FIELDS",
