@@ -401,3 +401,51 @@ def gpt2_hf_eager(hidden: int = 768, heads: int = 12, vocab: int = 50257,
     return ExtraSet(kernels, name="gpt2-hf-eager",
                     source="HuggingFace GPT-2, eager attention, DynamicCache, "
                            "profiled on an A100 (A100_Energy_Gap_Colab.ipynb)")
+
+
+def llama_hf_eager(hidden: int = 5120, kv_hidden: int = 5120,
+                   prec: str = "bf16") -> ExtraSet:
+    """What HuggingFace LLaMA launches beyond the generated template (`llama.py`).
+
+    The same executor as `gpt2_hf_eager` -- eager attention, one `DynamicCache`
+    per request -- so the mask building is the same (transformers' shared
+    `create_causal_mask`). LLaMA has one embedding (positions are rotary, in the
+    template), no per-block fills or causal `where`, and its LM head is in the
+    template. Predicted from transformers' source, not yet profiled: the LLaMA
+    notebook checks it.
+    """
+    ew = ("elementwise",)
+
+    def x(name, family, anchor, op, size, **kw):
+        return ExtraKernel(name, family, anchor, ew,
+                           {"dim": size, "op": op, "prec": prec}, **kw)
+
+    one = Mono(1)
+    per_q, per_k, per_qk = Mono(1, 1, 0), Mono(1, 0, 1), Mono(1, 1, 1)
+    kernels = (
+        x("embed_lookup", "index / embed", "prologue", "scalar_add", Mono(hidden, 1, 0),
+          note="token embedding gather, one row per new token"),
+        x("arange_q", "index / embed", "prologue", "scalar_add", per_q,
+          note="cache_position = arange(past, past + q)"),
+        x("arange_k", "index / embed", "prologue", "scalar_add", per_k,
+          note="the mask's key positions, arange(k)"),
+        x("arange_scalar", "index / embed", "prologue", "scalar_add", one, count=2,
+          note="the mask's batch and head aranges, one element each"),
+        x("mask_offset", "elementwise", "prologue", "scalar_add", per_k,
+          note="key positions += offset"),
+        x("mask_compare", "elementwise", "prologue", "scalar_add", per_qk,
+          note="the causal rule kv_idx <= q_idx, over q x k"),
+        x("mask_scalar_copy", "copy", "prologue", "scalar_add", one,
+          note="torch.tensor(0.0, device=cuda): a host-to-device copy"),
+        x("mask_fill", "fill", "prologue", "scalar_add", one,
+          note="the dtype-min scalar for the mask"),
+        x("mask_where", "where / mask", "prologue", "pointwise_add", per_qk,
+          note="boolean mask -> 0 / dtype min, over q x k"),
+        x("kv_cache_cat", "cat", "before_attn", "scalar_add", Mono(kv_hidden, 0, 1), count=2,
+          note="DynamicCache.update: torch.cat of K, then of V, k x kv_hidden each"),
+        x("merge_heads_copy", "copy", "after_attn", "scalar_add", Mono(hidden, 1, 0),
+          min_query=2, note="transpose(1, 2).contiguous(); free for a single token"),
+    )
+    return ExtraSet(kernels, name="llama-hf-eager",
+                    source="HuggingFace LLaMA, eager attention, DynamicCache; "
+                           "predicted from transformers' source")
